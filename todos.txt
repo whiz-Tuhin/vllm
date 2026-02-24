@@ -1,0 +1,7 @@
+PR for XBO - https://github.com/vllm-project/vllm/pull/30120
+
+Pytorch Traces - 
+- For the current run deepseek v2
+- run xbo from above PR 
+
+- Go into the details of the AFD codebase with vllm

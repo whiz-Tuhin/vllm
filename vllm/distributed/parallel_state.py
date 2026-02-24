@@ -1097,8 +1097,11 @@ def init_afd_process_group(
         store.set_timeout(timeout)
         store = PrefixStore(group_name, store)
 
+    torch_version = tuple(
+        int(x) for x in torch.__version__.split("+")[0].split(".")[:2]
+    )
     pg_options_param_name = (
-        "backend_options" if str(torch.__version__) >= "2.6" else "pg_options"
+        "backend_options" if torch_version >= (2, 6) else "pg_options"
     )
     pg, _ = _new_process_group_helper(
         world_size,

@@ -273,6 +273,11 @@ class P2PAFDConnector(AFDConnectorBase):
 
         if comm_id is not None:
             # PyNCCL uses rank in group
+            logger.info(
+                f"[AFD_DIAG] SEND shape={hidden_states.shape} dtype={hidden_states.dtype} "
+                f"sum={hidden_states.float().sum().item():.4f} "
+                f"mean={hidden_states.float().mean().item():.6f} dst={dst}"
+            )
             torch.ops.vllm.afd_p2p_send(hidden_states, dst, comm_id)
         else:
             raise RuntimeError("PyNCCL communicator is required but not available.")
@@ -320,6 +325,11 @@ class P2PAFDConnector(AFDConnectorBase):
                     device=tensor_metadata.device,
                 )
             torch.ops.vllm.afd_p2p_recv(hidden_states, src, comm_id)
+            logger.info(
+                f"[AFD_DIAG] RECV shape={hidden_states.shape} dtype={hidden_states.dtype} "
+                f"sum={hidden_states.float().sum().item():.4f} "
+                f"mean={hidden_states.float().mean().item():.6f} src={src}"
+            )
         else:
             raise RuntimeError("PyNCCL communicator is required but not available.")
         return hidden_states

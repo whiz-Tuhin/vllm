@@ -3625,7 +3625,17 @@ class GPUModelRunner(
                         ubatch_num_tokens_across_dp,
                     )
             else:
-                dp_metadata_list[0] = get_forward_context().dp_metadata
+                dp_metadata = get_forward_context().dp_metadata
+                if dp_metadata is None:
+                    # data_parallel_size=1: no DPMetadata created by
+                    # set_forward_context. Build a synthetic one.
+                    dp_metadata = DPMetadata(
+                        max_tokens_across_dp_cpu=torch.tensor(
+                            [num_tokens_padded], dtype=torch.int32),
+                        num_tokens_across_dp_cpu=torch.tensor(
+                            [num_tokens_padded], dtype=torch.int32),
+                    )
+                dp_metadata_list[0] = dp_metadata
 
             # to support inequal AF,[ffn_size,ffn_size + min_size) send
             if self.afd_config and self.afd_connector.is_attn_top_min_size_rank(self.afd_connector.world_rank):
@@ -4981,7 +4991,17 @@ class GPUModelRunner(
                             ubatch_num_tokens_across_dp,
                         )
                 else:
-                    dp_metadata_list[0] = get_forward_context().dp_metadata
+                    dp_metadata = get_forward_context().dp_metadata
+                    if dp_metadata is None:
+                        # data_parallel_size=1: no DPMetadata created by
+                        # set_forward_context. Build a synthetic one.
+                        dp_metadata = DPMetadata(
+                            max_tokens_across_dp_cpu=torch.tensor(
+                                [num_tokens_padded], dtype=torch.int32),
+                            num_tokens_across_dp_cpu=torch.tensor(
+                                [num_tokens_padded], dtype=torch.int32),
+                        )
+                    dp_metadata_list[0] = dp_metadata
 
                 # to support inequal AF,[ffn_size,ffn_size + min_size) send
                 if self.afd_config and self.afd_connector.is_attn_top_min_size_rank(self.afd_connector.world_rank):
