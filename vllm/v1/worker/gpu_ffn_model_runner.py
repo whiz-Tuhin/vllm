@@ -62,15 +62,16 @@ class GPUFFNModelRunner(LoRAModelRunnerMixin):
                 torch.profiler.ProfilerActivity.CUDA,
             ],
             schedule=torch.profiler.schedule(
-                wait=1000, warmup=1, active=10, repeat=1
+                wait=5, warmup=2, active=10, repeat=1
             ),
             on_trace_ready=torch.profiler.tensorboard_trace_handler(
-                "./profiler_logs/ffn"
+                "/tmp/pytorch-traces/ffn"
             ),
             record_shapes=True,
             profile_memory=False,
             with_stack=False,
         )
+        self.profiler.start()
 
         # Initialize CUDA graph support
         self.use_cuda_graph = not self.model_config.enforce_eager
@@ -156,24 +157,36 @@ class GPUFFNModelRunner(LoRAModelRunnerMixin):
         # for layer_idx in range(self.first_k_dense_replace,self.num_layers):
         for layer_idx in range(0, self.num_layers):
             for ubatch_idx in range(num_ubatches):
-                hidden_states, recv_metadata = self.connector.recv_attn_output(ubatch_idx=ubatch_idx)
-                dp_metadata = dp_metadata_list.get(
-                    recv_metadata.stage_idx, None
-                )
-                if recv_metadata is not None and recv_metadata.recv_handle_list is not None:
-                    for work in recv_metadata.recv_handle_list:
-                        work.wait()
-                # Fallback to eager mode
-                with set_forward_context(
-                    attn_metadata=None, vllm_config=self.vllm_config
+                with torch.profiler.record_function(
+                    f"ffn_layer_{layer_idx}_ubatch_{ubatch_idx}"
                 ):
-                    get_forward_context().dp_metadata = dp_metadata
-                    rank_ffn_output = self._execute_eager_mode(
-                        hidden_states, layer_idx
+                    with torch.profiler.record_function(
+                        f"ffn_recv_attn_output_layer_{layer_idx}_ubatch_{ubatch_idx}"
+                    ):
+                        hidden_states, recv_metadata = self.connector.recv_attn_output(ubatch_idx=ubatch_idx)
+                    dp_metadata = dp_metadata_list.get(
+                        recv_metadata.stage_idx, None
                     )
+                    if recv_metadata is not None and recv_metadata.recv_handle_list is not None:
+                        for work in recv_metadata.recv_handle_list:
+                            work.wait()
+                    # Fallback to eager mode
+                    with set_forward_context(
+                        attn_metadata=None, vllm_config=self.vllm_config
+                    ):
+                        get_forward_context().dp_metadata = dp_metadata
+                        with torch.profiler.record_function(
+                            f"ffn_compute_layer_{layer_idx}_ubatch_{ubatch_idx}"
+                        ):
+                            rank_ffn_output = self._execute_eager_mode(
+                                hidden_states, layer_idx
+                            )
 
-                recv_metadata.recv_handle_list = None
-                self.connector.send_ffn_output(rank_ffn_output, recv_metadata)
+                    recv_metadata.recv_handle_list = None
+                    with torch.profiler.record_function(
+                        f"ffn_send_output_layer_{layer_idx}_ubatch_{ubatch_idx}"
+                    ):
+                        self.connector.send_ffn_output(rank_ffn_output, recv_metadata)
         self._execute_model_count += 1
         return rank_ffn_output
 

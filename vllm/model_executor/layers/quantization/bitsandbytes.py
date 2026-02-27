@@ -509,6 +509,10 @@ class BitsAndBytesMoEMethod(FusedMoEMethodBase):
             w13, w2 = self._apply_8bit_dequant(layer)
         else:
             w13, w2 = self._apply_4bit_dequnt(layer)
+        # Cast weights to match activation dtype (e.g. bf16 weights -> fp16
+        # activations when --dtype float16 is used with bitsandbytes).
+        w13 = w13.to(x.dtype)
+        w2 = w2.to(x.dtype)
         return fused_experts(
             hidden_states=x,
             w1=w13,

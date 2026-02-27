@@ -278,7 +278,19 @@ class P2PAFDConnector(AFDConnectorBase):
                 f"sum={hidden_states.float().sum().item():.4f} "
                 f"mean={hidden_states.float().mean().item():.6f} dst={dst}"
             )
-            torch.ops.vllm.afd_p2p_send(hidden_states, dst, comm_id)
+            direction = "attn->ffn" if process_group == self.a2e_group else "ffn->attn"
+            nvtx_msg = (
+                f"afd_p2p_send"
+                f"|direction={direction}"
+                f"|shape={list(hidden_states.shape)}"
+                f"|dtype={hidden_states.dtype}"
+                f"|pg={process_group.unique_name}"
+                f"|dst={dst}"
+                f"|bytes={hidden_states.numel() * hidden_states.element_size()}"
+            )
+            with torch.profiler.record_function("afd_p2p_send", args=nvtx_msg), \
+                 torch.cuda.nvtx.range(nvtx_msg):
+                torch.ops.vllm.afd_p2p_send(hidden_states, dst, comm_id)
         else:
             raise RuntimeError("PyNCCL communicator is required but not available.")
 
@@ -324,7 +336,19 @@ class P2PAFDConnector(AFDConnectorBase):
                     dtype=tensor_metadata.dtype,
                     device=tensor_metadata.device,
                 )
-            torch.ops.vllm.afd_p2p_recv(hidden_states, src, comm_id)
+            direction = "ffn<-attn" if process_group == self.a2e_group else "attn<-ffn"
+            nvtx_msg = (
+                f"afd_p2p_recv"
+                f"|direction={direction}"
+                f"|shape={size}"
+                f"|dtype={tensor_metadata.dtype}"
+                f"|pg={process_group.unique_name}"
+                f"|src={src}"
+                f"|bytes={hidden_states.numel() * hidden_states.element_size()}"
+            )
+            with torch.profiler.record_function("afd_p2p_recv", args=nvtx_msg), \
+                 torch.cuda.nvtx.range(nvtx_msg):
+                torch.ops.vllm.afd_p2p_recv(hidden_states, src, comm_id)
             logger.info(
                 f"[AFD_DIAG] RECV shape={hidden_states.shape} dtype={hidden_states.dtype} "
                 f"sum={hidden_states.float().sum().item():.4f} "

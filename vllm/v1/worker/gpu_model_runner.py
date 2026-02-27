@@ -726,9 +726,9 @@ class GPUModelRunner(
         self.layerwise_nvtx_hooks_registered = False
 
         profile_dir = (
-            "./profiler_logs/attn"
+            "/tmp/pytorch-traces/attn"
             if self.afd_config is not None and self.afd_config.afd_role == "attention"
-            else "./profiler_logs/normal"
+            else "/tmp/pytorch-traces/normal"
         )
         self.profiler = torch.profiler.profile(
             activities=[
@@ -736,13 +736,14 @@ class GPUModelRunner(
                 torch.profiler.ProfilerActivity.CUDA,
             ],
             schedule=torch.profiler.schedule(
-                wait=1000, warmup=1, active=10, repeat=1
+                wait=5, warmup=2, active=10, repeat=1
             ),
             on_trace_ready=torch.profiler.tensorboard_trace_handler(profile_dir),
             record_shapes=True,
             profile_memory=False,
             with_stack=False,
         )
+        self.profiler.start()
 
     def update_max_model_len(self, max_model_len: int) -> None:
         self.max_model_len = max_model_len
