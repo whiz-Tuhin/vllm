@@ -13,6 +13,7 @@ from vllm.config.compilation import CUDAGraphMode
 from vllm.distributed.afd_transfer.afd_connector.factory import AFDConnectorFactory
 from vllm.distributed.afd_transfer.afd_connector.metadata import AFDConnectorMetadata
 from vllm.distributed.communication_op import tensor_model_parallel_all_gather
+from vllm.profiler.wrapper import TorchProfilerWrapper, CudaProfilerWrapper
 from vllm.distributed.parallel_state import (
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
@@ -55,22 +56,21 @@ class GPUFFNModelRunner(LoRAModelRunnerMixin):
 
         self._counter = 0
 
-        # Initialize torch.profile for performance monitoring
-        self.profiler = torch.profiler.profile(
-            activities=[
-                torch.profiler.ProfilerActivity.CPU,
-                torch.profiler.ProfilerActivity.CUDA,
-            ],
-            schedule=torch.profiler.schedule(
-                wait=1000, warmup=1, active=10, repeat=1
-            ),
-            on_trace_ready=torch.profiler.tensorboard_trace_handler(
-                "./profiler_logs/ffn"
-            ),
-            record_shapes=True,
-            profile_memory=False,
-            with_stack=False,
-        )
+        # Torch/CUDA profiler. Enabled and configured through profiler_config.
+        self.profiler: Any = None
+        profiler_config = vllm_config.profiler_config
+        if profiler_config.profiler == "torch":
+            worker_name = f"ffn-{vllm_config.instance_id}-rank-{get_world_group().rank}"
+            self.profiler = TorchProfilerWrapper(
+                profiler_config,
+                worker_name=worker_name,
+                local_rank=get_world_group().local_rank,
+                activities=["CPU", "CUDA"],
+            )
+        elif profiler_config.profiler == "cuda":
+            self.profiler = CudaProfilerWrapper(profiler_config)
+        else:
+            self.profiler = None
 
         # Initialize CUDA graph support
         self.use_cuda_graph = not self.model_config.enforce_eager
@@ -187,7 +187,8 @@ class GPUFFNModelRunner(LoRAModelRunnerMixin):
         is_graph_capturing: bool = False
     ):
         """Execute FFN computation for a single request"""
-        self.profiler.step()
+        if self.profiler is not None:
+            self.profiler.step()
         try:
             if self.use_cuda_graph and dp_metadata_list is not None:
                 graph_key = self._make_graph_key(dp_metadata_list)

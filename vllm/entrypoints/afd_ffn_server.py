@@ -51,6 +51,14 @@ class AFDFFNServer:
         """Start FFN workers and wait for completion"""
         logger.info("AFD FFN Server started, workers running...")
         try:
+            # Start profiler on all FFN workers if profiler is configured
+            try:
+                self.model_executor.collective_rpc("profile", kwargs={"is_start": True})
+                logger.info("Profiler started on FFN workers")
+            except RuntimeError:
+                logger.info("Profiling not enabled for FFN workers "
+                            "(use --profiler-config to enable)")
+
             # Tell workers to start FFN server loops (one-time call)
             self.model_executor.collective_rpc("start_ffn_server_loop")
 
@@ -60,6 +68,12 @@ class AFDFFNServer:
 
         except KeyboardInterrupt:
             logger.info("Server shutting down...")
+            # Stop profiler to flush traces before shutdown
+            try:
+                self.model_executor.collective_rpc("profile", kwargs={"is_start": False})
+                logger.info("Profiler stopped on FFN workers, traces flushed")
+            except (RuntimeError, Exception):
+                pass
             self.model_executor.collective_rpc("stop_ffn_server_loop")
         except Exception as e:
             logger.error("Server error: %s", e)
