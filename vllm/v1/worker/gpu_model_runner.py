@@ -934,6 +934,14 @@ class GPUModelRunner(LoRAModelRunnerMixin):
 
         # Run the decoder.
         # Use persistent buffers for CUDA graphs.
+
+        # PROFILING HOOK: forward pass start
+        import time as _fwd_time
+        _fwd_start_ts = _fwd_time.time()
+        _fwd_start_evt = torch.cuda.Event(enable_timing=True)
+        _fwd_end_evt = torch.cuda.Event(enable_timing=True)
+        _fwd_start_evt.record()
+
         with set_forward_context(attn_metadata, self.vllm_config):
             hidden_states = self.model(
                 input_ids=input_ids,
@@ -943,6 +951,26 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 intermediate_tensors=intermediate_tensors,
                 inputs_embeds=inputs_embeds,
             )
+
+        # PROFILING HOOK: forward pass end
+        _fwd_end_evt.record()
+        torch.cuda.synchronize()
+        _fwd_end_ts = _fwd_time.time()
+        _fwd_dur_ms = _fwd_start_evt.elapsed_time(_fwd_end_evt)
+        try:
+            from vllm.profiling.fp_logger import get_fp_logger as _gfl
+            _fl = _gfl()
+            if _fl:
+                _req_ids = list(self.input_batch.req_ids)
+                _ntoks = {
+                    r: scheduler_output.num_scheduled_tokens.get(r, 0)
+                    for r in _req_ids
+                }
+                _fl.record(_fwd_start_ts, _fwd_end_ts, _fwd_dur_ms,
+                           _req_ids, _ntoks)
+        except Exception:
+            pass
+
         if not get_pp_group().is_last_rank:
             # For mid-pipeline stages, return the hidden states.
             return hidden_states

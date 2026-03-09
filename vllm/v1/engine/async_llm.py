@@ -163,6 +163,15 @@ class AsyncLLM(EngineClient):
         if self.log_requests:
             logger.info("Added request %s.", request_id)
 
+        # PROFILING HOOK: record engine-add-request timestamp
+        try:
+            from vllm.profiling.tracer import get_tracer as _gpt
+            _pt = _gpt()
+            if _pt:
+                _pt.record_engine_add_request(request_id)
+        except Exception:
+            pass
+
         return queue
 
     # TODO: we should support multiple prompts in one call, as you
@@ -216,6 +225,8 @@ class AsyncLLM(EngineClient):
             # The output_handler task pushes items into the queue.
             # This task pulls from the queue and yields to caller.
             finished = False
+            _prof_first_seen = False  # PROFILING
+            _prof_total_tokens = 0   # PROFILING: accumulate across delta yields
             while not finished:
                 # Note: drain queue without await if possible (avoids
                 # task switching under load which helps performance).
@@ -232,6 +243,29 @@ class AsyncLLM(EngineClient):
                 # Note: both OutputProcessor and EngineCore handle their
                 # own request cleanup based on finished.
                 finished = out.finished
+
+                # PROFILING HOOK: first_token_ts, token_timestamps, completion_ts
+                try:
+                    from vllm.profiling.tracer import get_tracer as _gpt
+                    _pt = _gpt()
+                    if _pt and out.outputs:
+                        if not _prof_first_seen:
+                            _pt.record_first_token(request_id)
+                            _prof_first_seen = True
+                        # Record delivery timestamp for every yielded token chunk
+                        _pt.record_token(request_id)
+                        # Accumulate tokens per delta yield (streaming) or take
+                        # the cumulative total on the final yield (non-streaming)
+                        _prof_total_tokens += sum(
+                            len(o.token_ids) for o in out.outputs)
+                        if finished:
+                            _ptok = (len(out.prompt_token_ids)
+                                     if out.prompt_token_ids else 0)
+                            _pt.record_completion(
+                                request_id, _prof_total_tokens, _ptok)
+                except Exception:
+                    pass
+
                 yield out
 
         # If the request is disconnected by the client, the
