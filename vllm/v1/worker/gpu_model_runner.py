@@ -36,6 +36,7 @@ from vllm.distributed.ec_transfer import get_ec_transfer, has_ec_transfer
 from vllm.distributed.eplb.eplb_state import EplbState
 from vllm.distributed.kv_transfer import get_kv_transfer_group, has_kv_transfer_group
 from vllm.distributed.kv_transfer.kv_connector.utils import copy_kv_blocks
+from vllm.profiler.wrapper import TorchProfilerWrapper, CudaProfilerWrapper
 from vllm.distributed.parallel_state import (
     get_dcp_group,
     get_pp_group,
@@ -725,25 +726,22 @@ class GPUModelRunner(
         self.mamba_state_idx: dict[str, int] = {}
         self.layerwise_nvtx_hooks_registered = False
 
-        profile_dir = (
-            "/tmp/pytorch-traces/attn"
-            if self.afd_config is not None and self.afd_config.afd_role == "attention"
-            else "/tmp/pytorch-traces/normal"
-        )
-        self.profiler = torch.profiler.profile(
-            activities=[
-                torch.profiler.ProfilerActivity.CPU,
-                torch.profiler.ProfilerActivity.CUDA,
-            ],
-            schedule=torch.profiler.schedule(
-                wait=5, warmup=2, active=10, repeat=1
-            ),
-            on_trace_ready=torch.profiler.tensorboard_trace_handler(profile_dir),
-            record_shapes=True,
-            profile_memory=False,
-            with_stack=False,
-        )
-        self.profiler.start()
+        # Torch/CUDA profiler. Enabled and configured through profiler_config.
+        self.profiler: Any = None
+        profiler_config = vllm_config.profiler_config
+        if profiler_config.profiler == "torch":
+            role = "attn" if (self.afd_config is not None and self.afd_config.afd_role == "attention") else "normal"
+            worker_name = f"{role}-{vllm_config.instance_id}-rank-{get_world_group().rank}"
+            self.profiler = TorchProfilerWrapper(
+                profiler_config,
+                worker_name=worker_name,
+                local_rank=get_world_group().local_rank,
+                activities=["CPU", "CUDA"],
+            )
+        elif profiler_config.profiler == "cuda":
+            self.profiler = CudaProfilerWrapper(profiler_config)
+        else:
+            self.profiler = None
 
     def update_max_model_len(self, max_model_len: int) -> None:
         self.max_model_len = max_model_len
@@ -3588,7 +3586,8 @@ class GPUModelRunner(
 
         afd_metadata = self._build_afd_metadata(ubatch_slices_padded, num_tokens_unpadded)
 
-        self.profiler.step()
+        if self.profiler is not None:
+            self.profiler.step()
         # Run the model.
         # Use persistent buffers for CUDA graphs.
         with (

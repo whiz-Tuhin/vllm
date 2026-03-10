@@ -26,7 +26,7 @@ from vllm.utils.torch_utils import direct_register_custom_op
 from .base import AFDConnectorBase
 from .metadata import AFDConnectorMetadata
 
-logger = init_logger(__name__)
+logger = init_logger(__name__) 
 
 # -------------------------------------------------------------------------
 # Custom Ops Registration for P2P Communication
