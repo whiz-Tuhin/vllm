@@ -7,7 +7,9 @@ Activated by env vars:
   VLLM_PROF_OUTPUT_DIR — directory to write forward pass JSONL
 
 Each line written:
-  {fwd_id, start_ts, end_ts, duration_ms, req_ids, num_tokens, total_tokens}
+  {fwd_id, start_ts, end_ts, duration_ms, req_ids, num_tokens, total_tokens,
+   requests: {req_id: {num_scheduled_tokens, is_prefill, past_kv_cache_size,
+              prefix_tokens, decode_tokens, tokens_generated_so_far, num_prompt_tokens}}}
 """
 import json
 import os
@@ -35,6 +37,7 @@ class ForwardPassLogger:
         duration_ms: float,
         req_ids: List[str],
         num_tokens: Dict[str, int],
+        requests: Optional[Dict[str, dict]] = None,
     ):
         with self._lock:
             fwd_id = self._counter
@@ -48,6 +51,8 @@ class ForwardPassLogger:
                 "num_tokens": num_tokens,
                 "total_tokens": sum(num_tokens.values()),
             }
+            if requests is not None:
+                entry["requests"] = requests
             self._file.write(json.dumps(entry) + "\n")
             self._file.flush()
 

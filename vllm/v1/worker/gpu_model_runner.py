@@ -966,8 +966,23 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     r: scheduler_output.num_scheduled_tokens.get(r, 0)
                     for r in _req_ids
                 }
+                _req_details = {}
+                for _rid in _req_ids:
+                    _rs = self.requests.get(_rid)
+                    if _rs is None:
+                        continue
+                    _nsched = _ntoks.get(_rid, 0)
+                    _req_details[_rid] = {
+                        "num_scheduled_tokens": _nsched,
+                        "is_prefill": _nsched > 1,
+                        "past_kv_cache_size": _rs.num_computed_tokens,
+                        "prefix_tokens": len(_rs.prompt_token_ids),
+                        "decode_tokens": _nsched if _nsched == 1 else 0,
+                        "tokens_generated_so_far": len(_rs.output_token_ids),
+                        "num_prompt_tokens": len(_rs.prompt_token_ids),
+                    }
                 _fl.record(_fwd_start_ts, _fwd_end_ts, _fwd_dur_ms,
-                           _req_ids, _ntoks)
+                           _req_ids, _ntoks, _req_details)
         except Exception:
             pass
 
