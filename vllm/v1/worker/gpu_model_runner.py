@@ -3642,6 +3642,11 @@ class GPUModelRunner(
                 logger.info(f'jcz self.afd_connector.world_rank in prepare input is {self.afd_connector.world_rank}')
                 logger.info(f'jcz self.afd_connector.world_rank in prepare input dp_metadata_list:{dp_metadata_list}')
                 self.afd_connector.send_dp_metadata_list(dp_metadata_list)
+            elif self.afd_config and self.afd_connector.is_initialized():
+                # --- NEW CODE: Non-top-min-size ATTN ranks still need local metadata
+                # for recv_ffn_output to know tensor shapes. send_dp_metadata_list calls
+                # update_state_from_dp_metadata internally, but non-sending ranks skip it. ---
+                self.afd_connector.update_state_from_dp_metadata(dp_metadata_list)
             logger.info(f'jcz send dp_metadata_list in prepare input')
 
             model_output = self._model_forward(
@@ -5008,6 +5013,8 @@ class GPUModelRunner(
                     logger.info(f'jcz self.afd_connector.world_rank in prepare input is {self.afd_connector.world_rank}')
                     logger.info(f'jcz self.afd_connector.world_rank in prepare input dp_metadata_list:{dp_metadata_list}')
                     self.afd_connector.send_dp_metadata_list(dp_metadata_list, is_graph_capturing)
+                elif self.afd_config and self.afd_connector.is_initialized():
+                    self.afd_connector.update_state_from_dp_metadata(dp_metadata_list, is_graph_capturing)
                 logger.info(f'jcz send dp_metadata_list in prepare input')
                 outputs = self.model(
                     input_ids=input_ids,
