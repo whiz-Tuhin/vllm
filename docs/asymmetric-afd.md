@@ -256,7 +256,7 @@ curl http://localhost:8000/v1/completions \
   -d '{"model":"deepseek-ai/DeepSeek-V2-Lite","prompt":"Hello, how are you","max_tokens":32}'
 
 # Benchmark (vLLM built-in)
-python benchmarks/benchmark_serving.py \
+vllm bench serve \
   --backend vllm \
   --model deepseek-ai/DeepSeek-V2-Lite \
   --dataset-name random \
