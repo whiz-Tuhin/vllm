@@ -780,6 +780,13 @@ class VllmConfig:
                     scope="local",
                 )
                 self.scheduler_config.async_scheduling = False
+            elif "dry_run" in self.parallel_config.worker_cls:
+                logger.warning_once(
+                    "Async scheduling disabled for DryRunWorker (single-"
+                    "process simulation does not support async scheduling).",
+                    scope="local",
+                )
+                self.scheduler_config.async_scheduling = False
             else:
                 self.scheduler_config.async_scheduling = True
 
