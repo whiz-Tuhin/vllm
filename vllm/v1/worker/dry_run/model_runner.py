@@ -331,7 +331,7 @@ class DryRunModelRunner:
                 moe_tp=max(self.tp_size, 1),
                 moe_ep=self.ep_size,
                 num_tokens=max(num_tokens, 1),
-                workload="uniform",
+                workload="power_law_1.01",
             )
             if not self._logged_moe:
                 logger.info(
