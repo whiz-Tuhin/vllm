@@ -126,6 +126,7 @@ class DryRunModelRunner:
             self.is_moe_model = False
             self.moe_layer_mask = [False] * self.num_layers
         self._logged_moe = False
+        self._logged_comm = False
 
         # Parallelism
         self.tp_size: int = vllm_config.parallel_config.tensor_parallel_size
@@ -282,8 +283,19 @@ class DryRunModelRunner:
                 hidden_size=self.hidden_size,
                 num_layers=self.num_layers,
                 num_moe_layers=num_moe_layers,
+                num_experts=self.num_experts,
+                topk=self.num_experts_per_tok,
             )
             total_us += comm_overhead.total_us
+            if not self._logged_comm:
+                logger.info(
+                    "Communication overhead: tp_allreduce=%.1f μs, "
+                    "ep_all2all=%.1f μs, total=%.1f μs",
+                    comm_overhead.tp_allreduce_us,
+                    comm_overhead.ep_all2all_us,
+                    comm_overhead.total_us,
+                )
+                self._logged_comm = True
 
         return total_us
 
