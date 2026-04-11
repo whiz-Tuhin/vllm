@@ -152,8 +152,6 @@ class GPUFFNModelRunner(LoRAModelRunnerMixin):
             dp_metadata_list, is_graph_capturing=is_graph_capturing
         )
         
-        # TODO(jcz): process first_k_dense_replace
-        # for layer_idx in range(self.first_k_dense_replace,self.num_layers):
         for layer_idx in range(0, self.num_layers):
             for ubatch_idx in range(num_ubatches):
                 with torch.profiler.record_function(
@@ -162,14 +160,15 @@ class GPUFFNModelRunner(LoRAModelRunnerMixin):
                     with torch.profiler.record_function(
                         f"ffn_recv_attn_output_layer_{layer_idx}_ubatch_{ubatch_idx}"
                     ):
-                        hidden_states, recv_metadata = self.connector.recv_attn_output(ubatch_idx=ubatch_idx)
-                    dp_metadata = dp_metadata_list.get(
-                        recv_metadata.stage_idx, None
-                    )
-                    if recv_metadata is not None and recv_metadata.recv_handle_list is not None:
-                        for work in recv_metadata.recv_handle_list:
-                            work.wait()
-                    # Fallback to eager mode
+                        hidden_states, recv_metadata = (
+                            self.connector.recv_attn_output(ubatch_idx=ubatch_idx)
+                        )
+                    dp_metadata = dp_metadata_list.get(recv_metadata.stage_idx, None)
+                    # AFD pre-routing: topk_ids/topk_weights come from ATTN
+                    # via recv_attn_output (populated in AFDConnectorMetadata).
+                    topk_ids = getattr(recv_metadata, "topk_ids", None)
+                    topk_weights = getattr(recv_metadata, "topk_weights", None)
+
                     with set_forward_context(
                         attn_metadata=None, vllm_config=self.vllm_config
                     ):
@@ -178,10 +177,12 @@ class GPUFFNModelRunner(LoRAModelRunnerMixin):
                             f"ffn_compute_layer_{layer_idx}_ubatch_{ubatch_idx}"
                         ):
                             rank_ffn_output = self._execute_eager_mode(
-                                hidden_states, layer_idx
+                                hidden_states,
+                                layer_idx,
+                                topk_ids=topk_ids,
+                                topk_weights=topk_weights,
                             )
 
-                    recv_metadata.recv_handle_list = None
                     with torch.profiler.record_function(
                         f"ffn_send_output_layer_{layer_idx}_ubatch_{ubatch_idx}"
                     ):
@@ -230,31 +231,30 @@ class GPUFFNModelRunner(LoRAModelRunnerMixin):
         self,
         hidden_states: torch.Tensor,
         current_layer_idx: int,
+        topk_ids: torch.Tensor | None = None,
+        topk_weights: torch.Tensor | None = None,
     ):
-        """Execute FFN computation in eager mode (fallback)."""
-        # Step the profiler for performance monitoring
+        """FFN eager compute for one layer.
 
-        # Handle TP case: all-gather tensors from all TP ranks
-        tp_world_size = get_tensor_model_parallel_world_size()
-        if tp_world_size > 1:
-            # All-gather hidden states from all TP ranks
-            gathered_hidden_states = tensor_model_parallel_all_gather(
-                hidden_states, dim=0
-            )
-            ffn_output = self.model.compute_ffn_output(
-                gathered_hidden_states, current_layer_idx
-            )
-            # Extract the output corresponding to current rank
-            start_idx = hidden_states.shape[0] * get_tensor_model_parallel_rank()
-            end_idx = start_idx + hidden_states.shape[0]
-            rank_ffn_output = ffn_output[start_idx:end_idx, :]
-        else:
-            # Single TP case
-            rank_ffn_output = self.model.compute_ffn_output(
-                hidden_states, current_layer_idx
-            )
+        With the M×N pre-routing connector, each FFN worker already receives
+        every token it needs to process (directly from the ATTN side, via
+        recv_attn_output). Inter-FFN communication (EP all-gather /
+        reduce-scatter) is no longer needed for either dense or MoE layers:
 
-        return rank_ffn_output
+          - Dense layer 0 (DeepseekV2MLP, TP-sharded): every ATTN partner
+            broadcasts the same hidden_states, so both FFN TP workers end up
+            with identical input after concatenation. The TP-sharded MLP's
+            internal all-reduce still handles the intra-FFN TP work.
+          - MoE layers: tokens were pre-routed by the ATTN-side gate, so no
+            all-gather is required. ``forward_pre_routed`` runs only the
+            local experts.
+        """
+        return self.model.compute_ffn_output(
+            hidden_states,
+            current_layer_idx,
+            topk_ids=topk_ids,
+            topk_weights=topk_weights,
+        )
 
     # Methods required for interface compatibility with GPUModelRunner
     def profile_run(self) -> None:

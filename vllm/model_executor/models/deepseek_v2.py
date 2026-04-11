@@ -251,6 +251,13 @@ class DeepseekV2MoEAttentionStub(nn.Module):
         self.routed_scaling_factor = getattr(config, "routed_scaling_factor", 1.0)
         self.n_routed_experts: int = config.n_routed_experts
 
+        # Routing config (used by compute_route_and_shared).
+        self.top_k: int = config.num_experts_per_tok
+        self.renormalize: bool = config.norm_topk_prob
+        self.num_expert_group: int = getattr(config, "n_group", 1)
+        self.topk_group: int = getattr(config, "topk_group", 1)
+        self.scoring_func: str = getattr(config, "scoring_func", "softmax")
+
         self.gate = ReplicatedLinear(
             config.hidden_size,
             config.n_routed_experts,
@@ -277,6 +284,44 @@ class DeepseekV2MoEAttentionStub(nn.Module):
                 reduce_results=False,
                 prefix=f"{prefix}.shared_experts",
             )
+
+    def compute_route_and_shared(
+        self,
+        hidden_states: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
+        """Compute MoE routing decisions and shared-expert output locally.
+
+        This runs on the ATTN side as part of AFD pre-routing. Returns
+        ``(topk_ids, topk_weights, shared_output)`` where topk_ids (int32)
+        and topk_weights (float32) come from grouped top-k on the router
+        logits, and shared_output is the shared-expert MLP applied to every
+        token (or ``None`` if the model has no shared experts).
+        """
+        # Local import to avoid pulling fused_moe router at module load.
+        from vllm.model_executor.layers.fused_moe.router.grouped_topk_router import (
+            grouped_topk,
+        )
+
+        router_logits, _ = self.gate(hidden_states)
+        topk_weights, topk_ids = grouped_topk(
+            hidden_states=hidden_states,
+            gating_output=router_logits,
+            topk=self.top_k,
+            renormalize=self.renormalize,
+            num_expert_group=self.num_expert_group,
+            topk_group=self.topk_group,
+            scoring_func=self.scoring_func,
+            # Scaling is applied on the ATTN side when combining partials.
+            routed_scaling_factor=1.0,
+            e_score_correction_bias=self.gate.e_score_correction_bias,
+        )
+
+        if self.shared_experts is not None:
+            shared_output = self.shared_experts(hidden_states)
+        else:
+            shared_output = None
+
+        return topk_ids, topk_weights, shared_output
 
 
 class DeepseekV2MoE(nn.Module):
@@ -1141,17 +1186,44 @@ class DeepseekV2DecoderLayer(nn.Module):
 
         return hidden_states, residual
 
-    def compute_ffn_output(self, hidden_states):
+    def compute_ffn_output(
+        self,
+        hidden_states: torch.Tensor,
+        topk_ids: torch.Tensor | None = None,
+        topk_weights: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """FFN-side compute for one layer.
+
+        For dense layers (layer 0, ``self.mlp`` is DeepseekV2MLP), run the
+        TP-sharded MLP with its internal all-reduce.
+
+        For MoE layers in AFD pre-routing mode, ``topk_ids`` / ``topk_weights``
+        come from the ATTN side's gate via the connector. We bypass the full
+        DeepseekV2MoE.forward (which would re-run the gate, shared experts,
+        and the EP dispatch/combine) and call the routed experts directly
+        with the provided top-k. The shared-expert output is added on the
+        ATTN side, and routed_scaling is applied there too.
+        """
         assert self.afd_role == "ffn"
-        hidden_states = self.mlp(hidden_states)
-        if isinstance(self.mlp, DeepseekV2MLP) and hidden_states.dtype == torch.float16:
-            # Fix FP16 overflow
-            # Scaling the DeepseekV2MLP output, it is the input of
-            # input_layernorm of next decoder layer.
-            # The scaling of DeepseekV2MOE output would be done in the forward
-            # of DeepseekV2MOE
-            hidden_states *= 1.0 / self.routed_scaling_factor
-        return hidden_states
+
+        if isinstance(self.mlp, DeepseekV2MLP):
+            hidden_states = self.mlp(hidden_states)
+            if hidden_states.dtype == torch.float16:
+                # Fix FP16 overflow: rescale the DeepseekV2MLP output before
+                # it becomes the next layer's input.
+                hidden_states *= 1.0 / self.routed_scaling_factor
+            return hidden_states
+
+        # MoE layer with pre-routing — requires both topk tensors.
+        assert topk_ids is not None and topk_weights is not None, (
+            "compute_ffn_output for an MoE layer must receive pre-routed "
+            "topk_ids and topk_weights"
+        )
+        # self.mlp is DeepseekV2MoE on the FFN side; its experts attribute is
+        # a SharedFusedMoE (subclass of FusedMoE).
+        return self.mlp.experts.forward_pre_routed(
+            hidden_states, topk_ids, topk_weights,
+        )
 
 
 # @support_torch_compile
@@ -1221,10 +1293,24 @@ class DeepseekV2Model(nn.Module):
             if layer_idx > 0:
                 # Pass current hidden_states as ref_tensor to preserve dynamic shapes
                 hidden_states = afd_connector.recv_ffn_output(ref_tensor=hidden_states)
-            
+
             hidden_states, residual = layer(
                 positions, hidden_states, residual, llama_4_scaling
             )
+
+            # For MoE layers the ATTN side runs the router and the shared
+            # experts locally (see DeepseekV2MoEAttentionStub). send_attn_output
+            # then uses topk_ids to fan out each token only to the FFN partners
+            # holding its target experts; the shared-expert output is added
+            # to the combined FFN result in recv_ffn_output.
+            topk_ids: torch.Tensor | None = None
+            topk_weights: torch.Tensor | None = None
+            shared_output: torch.Tensor | None = None
+            if isinstance(getattr(layer, "mlp", None), DeepseekV2MoEAttentionStub):
+                topk_ids, topk_weights, shared_output = (
+                    layer.mlp.compute_route_and_shared(hidden_states)
+                )
+
             metadata = AFDConnectorMetadata.create_attention_metadata(
                 layer_idx=layer.layer_idx,
                 stage_idx=afd_metadata.afd_stage_idx,
@@ -1234,7 +1320,13 @@ class DeepseekV2Model(nn.Module):
                 num_of_stages=afd_metadata.num_of_stages,
                 afd_tokens_lens=afd_metadata.afd_tokens_lens,
             )
-            afd_connector.send_attn_output(hidden_states, metadata)
+            afd_connector.send_attn_output(
+                hidden_states,
+                metadata,
+                topk_ids=topk_ids,
+                topk_weights=topk_weights,
+                shared_output=shared_output,
+            )
 
             hidden_states = apply_dbo_yield(hidden_states)
 
@@ -1369,10 +1461,15 @@ class DeepseekV2Model(nn.Module):
         return hidden_states
 
     def compute_ffn_output(
-        self, hidden_states, layer_idx
+        self,
+        hidden_states,
+        layer_idx,
+        topk_ids: torch.Tensor | None = None,
+        topk_weights: torch.Tensor | None = None,
     ) -> torch.Tensor | IntermediateTensors:
-        hidden_states = self.layers[layer_idx].compute_ffn_output(hidden_states)
-        return hidden_states
+        return self.layers[layer_idx].compute_ffn_output(
+            hidden_states, topk_ids=topk_ids, topk_weights=topk_weights,
+        )
 
 
 class DeepseekV2MixtureOfExperts(MixtureOfExperts):
@@ -1520,10 +1617,18 @@ class DeepseekV2ForCausalLM(
         return hidden_states
 
     def compute_ffn_output(
-        self, hidden_states, current_layer_idx
+        self,
+        hidden_states,
+        current_layer_idx,
+        topk_ids: torch.Tensor | None = None,
+        topk_weights: torch.Tensor | None = None,
     ) -> torch.Tensor | IntermediateTensors:
-        hidden_states = self.model.compute_ffn_output(hidden_states, current_layer_idx)
-        return hidden_states
+        return self.model.compute_ffn_output(
+            hidden_states,
+            current_layer_idx,
+            topk_ids=topk_ids,
+            topk_weights=topk_weights,
+        )
 
     def compute_logits(
         self,

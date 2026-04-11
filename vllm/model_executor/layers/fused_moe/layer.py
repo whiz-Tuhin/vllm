@@ -1980,6 +1980,44 @@ class FusedMoE(CustomOp):
             else:
                 return combine_output(final_hidden_states)
 
+    def forward_pre_routed(
+        self,
+        hidden_states: torch.Tensor,
+        topk_ids: torch.Tensor,
+        topk_weights: torch.Tensor,
+    ) -> torch.Tensor:
+        """MoE expert compute with pre-computed routing.
+
+        Used by AFD pre-routing (see p2p_connector). Skips the gate,
+        router ``select_experts``, EP dispatch, EP combine, and the shared
+        experts — all of which are handled on the ATTN side or are not
+        applicable in the pre-routed flow. Each FFN worker only processes
+        the subset of tokens it received; ``expert_map`` inside the quant
+        method's apply() ensures non-local expert assignments contribute
+        zero.
+
+        Returns a [N_local_tokens, hidden_size] tensor of partial routed-
+        expert contributions. The ATTN side combines partials across FFN
+        partners via scatter-add.
+        """
+        assert self.quant_method is not None
+        self.ensure_moe_quant_config_init()
+
+        if hidden_states.shape[0] == 0:
+            # Empty shard — just return zeros of the expected shape.
+            return torch.zeros_like(hidden_states)
+
+        result = self.quant_method.apply(
+            layer=self,
+            x=hidden_states,
+            topk_weights=topk_weights,
+            topk_ids=topk_ids,
+        )
+        # SharedFusedMoE may return (shared, routed). We want only routed.
+        if isinstance(result, tuple):
+            _, result = result
+        return result
+
     @classmethod
     def make_expert_params_mapping(
         cls,
