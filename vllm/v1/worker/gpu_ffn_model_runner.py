@@ -161,7 +161,10 @@ class GPUFFNModelRunner(LoRAModelRunnerMixin):
                         f"ffn_recv_attn_output_layer_{layer_idx}_ubatch_{ubatch_idx}"
                     ):
                         hidden_states, recv_metadata = (
-                            self.connector.recv_attn_output(ubatch_idx=ubatch_idx)
+                            self.connector.recv_attn_output(
+                                ubatch_idx=ubatch_idx,
+                                layer_idx=layer_idx,
+                            )
                         )
                     dp_metadata = dp_metadata_list.get(recv_metadata.stage_idx, None)
                     # AFD pre-routing: topk_ids/topk_weights come from ATTN
