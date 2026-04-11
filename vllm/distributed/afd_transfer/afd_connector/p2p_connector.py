@@ -585,11 +585,13 @@ class P2PAFDConnector(AFDConnectorBase):
         assert dst < process_group.world_size, f"Invalid dst rank ({dst})"
         assert not hidden_states.is_cpu, "Hidden states must be on GPU"
 
-        logger.info(
-            f"[AFD_DIAG] SEND shape={hidden_states.shape} dtype={hidden_states.dtype} "
-            f"sum={hidden_states.float().sum().item():.4f} "
-            f"mean={hidden_states.float().mean().item():.6f} dst={dst}"
-        )
+        # --- OLD CODE (AFD_DIAG .item() forces CUDA sync — ~3s/layer with TP=2) ---
+        # logger.info(
+        #     f"[AFD_DIAG] SEND shape={hidden_states.shape} dtype={hidden_states.dtype} "
+        #     f"sum={hidden_states.float().sum().item():.4f} "
+        #     f"mean={hidden_states.float().mean().item():.6f} dst={dst}"
+        # )
+        # --- END OLD CODE ---
         nvtx_msg = (
             f"afd_p2p_send"
             f"|direction={direction}"
@@ -670,11 +672,9 @@ class P2PAFDConnector(AFDConnectorBase):
             and ref_tensor.dtype == tensor_metadata.dtype
             and ref_tensor.device == tensor_metadata.device
         ):
-            logger.info(f"jcz _recv_hidden_states ref_tensor is not None:{ref_tensor.shape}")
             hidden_states = ref_tensor
         else:
             # Note: If using cudagraph, this branch should not be taken
-            logger.info("jcz _recv_hidden_states ref_tensor is None")
             hidden_states = torch.empty(
                 tuple(size),
                 dtype=tensor_metadata.dtype,
@@ -692,11 +692,13 @@ class P2PAFDConnector(AFDConnectorBase):
         with torch.profiler.record_function("afd_p2p_recv", args=nvtx_msg), \
              torch.cuda.nvtx.range(nvtx_msg):
             torch.ops.vllm.afd_p2p_recv(hidden_states, src, comm_id)
-        logger.info(
-            f"[AFD_DIAG] RECV shape={hidden_states.shape} dtype={hidden_states.dtype} "
-            f"sum={hidden_states.float().sum().item():.4f} "
-            f"mean={hidden_states.float().mean().item():.6f} src={src}"
-        )
+        # --- OLD CODE (AFD_DIAG .item() forces CUDA sync — ~3s/layer with TP=2) ---
+        # logger.info(
+        #     f"[AFD_DIAG] RECV shape={hidden_states.shape} dtype={hidden_states.dtype} "
+        #     f"sum={hidden_states.float().sum().item():.4f} "
+        #     f"mean={hidden_states.float().mean().item():.6f} src={src}"
+        # )
+        # --- END OLD CODE ---
         return hidden_states
     # --- END NEW CODE ---
     
