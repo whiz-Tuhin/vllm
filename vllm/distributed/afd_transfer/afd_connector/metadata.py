@@ -38,8 +38,16 @@ class AFDConnectorMetadata:
     # multiple sequences
     dtype: torch.dtype
     device: torch.device
-    topk_idx: torch.Tensor | None = None  # indices token which expert to be sended
-    topk_weights: torch.Tensor | None = None  # the expert weights
+    # AFD pre-routing: global expert IDs (0..n_experts-1) that each token in
+    # this send was routed to. Shape [num_tokens, top_k]. Populated on the
+    # ATTN side after running the local gate/router; consumed on the FFN side
+    # to run expert compute without re-running the router.
+    topk_ids: torch.Tensor | None = None
+    # Corresponding top-k routing weights. Shape [num_tokens, top_k].
+    topk_weights: torch.Tensor | None = None
+    # Which ATTN DP rank originated these tokens. FFN uses this to split
+    # partial results back to the correct ATTN partner.
+    source_attn_rank: int | None = None
     moe_expert_num: int | None = None  # number of moe experts
     shared_expert_num: int | None = None  # number of share experts
     scale: torch.Tensor | None = None  #  quant scale
