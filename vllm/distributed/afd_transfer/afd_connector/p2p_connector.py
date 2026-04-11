@@ -29,8 +29,10 @@ Design:
 """
 
 import dataclasses
+import os
 import pickle
 import re
+import time
 from datetime import timedelta
 
 import torch
@@ -182,6 +184,50 @@ class PairGroup:
     unique_name: str = ""
 
 
+class _TimingProfiler:
+    """Per-process running totals of wall-clock time spent in each section
+    of the AFD hot path. Enabled by env var AFD_TIMING=1.
+
+    Not a CUDA profiler — it only captures the time spent in Python / host
+    code, so it's biased toward surfacing syncs (where the host waits for
+    the device) and dispatcher overhead. That's exactly what we're trying
+    to localize right now.
+    """
+    def __init__(self) -> None:
+        self.enabled: bool = os.environ.get("AFD_TIMING", "0") == "1"
+        self.totals: dict[str, float] = {}
+        self.calls: dict[str, int] = {}
+        self._forward_count: int = 0
+        self._dump_every: int = int(os.environ.get("AFD_TIMING_EVERY", "64"))
+
+    def add(self, section: str, dt: float) -> None:
+        if not self.enabled:
+            return
+        self.totals[section] = self.totals.get(section, 0.0) + dt
+        self.calls[section] = self.calls.get(section, 0) + 1
+
+    def mark_forward_pass_end(self, role: str, world_rank: int) -> None:
+        if not self.enabled:
+            return
+        self._forward_count += 1
+        if self._forward_count % self._dump_every != 0:
+            return
+        lines = [f"[AFD_TIMING role={role} rank={world_rank} "
+                 f"forwards={self._forward_count}]"]
+        for k in sorted(self.totals.keys()):
+            total = self.totals[k]
+            calls = self.calls[k]
+            avg_ms = (total / calls) * 1000 if calls else 0.0
+            lines.append(
+                f"  {k:42s} total={total*1000:9.2f}ms "
+                f"calls={calls:6d} avg={avg_ms:6.3f}ms"
+            )
+        logger.info("\n".join(lines))
+
+
+_timing = _TimingProfiler()
+
+
 # ----------------------------------------------------------------------
 # Connector
 # ----------------------------------------------------------------------
@@ -230,7 +276,13 @@ class P2PAFDConnector(AFDConnectorBase):
 
         # ATTN-side send→recv lifecycle state. Populated in send_attn_output;
         # consumed and cleared in recv_ffn_output.
+        # For MoE layers, _pending_masks is a list of GPU index tensors
+        # (one per partner, result of mask.nonzero()). _pending_counts is
+        # the Python-int counts read via a single .cpu() sync at send
+        # time, letting recv_ffn_output skip any further data-dependent
+        # operations that would force syncs behind pending NCCL/compute.
         self._pending_masks: list[torch.Tensor] | None = None
+        self._pending_counts: list[int] | None = None
         self._pending_shared_output: torch.Tensor | None = None
         self._pending_shape: tuple[int, ...] | None = None
         self._pending_dtype: torch.dtype | None = None
@@ -526,6 +578,8 @@ class P2PAFDConnector(AFDConnectorBase):
         self._pending_device = hidden_states.device
         self._pending_shared_output = shared_output
 
+        _t_send_total = time.perf_counter()
+
         if topk_ids is None:
             # Dense path: broadcast full tensor to every FFN partner.
             self._pending_masks = None
@@ -548,33 +602,56 @@ class P2PAFDConnector(AFDConnectorBase):
                         hidden_states, dst, comm_id,
                         nvtx_label=f"attn->ffn[hs,j={j}]",
                     )
+            _timing.add("send_attn.dense_total", time.perf_counter() - _t_send_total)
             return
 
-        # MoE pre-routing path.
+        # MoE pre-routing path — fast path: batch all data-dependent work,
+        # sync once to read counts + indices on CPU, then do all NCCL sends
+        # without any further syncs.
         assert topk_weights is not None
         assert self.experts_per_ffn_worker > 0
         assert topk_ids.shape[0] == hidden_states.shape[0]
         topk_k = topk_ids.shape[1]
 
-        masks: list[torch.Tensor] = []
-        for j in range(n_partners):
-            start_expert = j * self.experts_per_ffn_worker
-            end_expert = start_expert + self.experts_per_ffn_worker
-            # Token i is relevant to FFN_j if any of its top-k expert ids
-            # falls in [start, end).
-            in_range = (topk_ids >= start_expert) & (topk_ids < end_expert)
-            token_mask = in_range.any(dim=1)  # [N]
-            masks.append(token_mask)
+        # ---- Stage 1: batched mask computation on GPU (async). ----
+        _t = time.perf_counter()
+        starts = torch.arange(n_partners, device=hidden_states.device) * \
+            self.experts_per_ffn_worker
+        ends = starts + self.experts_per_ffn_worker
+        # in_range: [P, N, K] where P=n_partners.
+        in_range = (topk_ids.unsqueeze(0) >= starts[:, None, None]) & (
+            topk_ids.unsqueeze(0) < ends[:, None, None]
+        )
+        all_masks = in_range.any(dim=-1)  # [P, N]
+        counts = all_masks.sum(dim=1)  # [P]
+        _timing.add("send_attn.moe.mask_compute", time.perf_counter() - _t)
 
-            hs_j = hidden_states[token_mask]
-            topk_ids_j = topk_ids[token_mask]
-            topk_weights_j = topk_weights[token_mask]
-            count_j = hs_j.shape[0]
+        # ---- Stage 2: ONE sync to read counts, and precompute nonzero
+        # indices per partner now (while we're paying the sync cost
+        # anyway — any later .item() would pay the same). ----
+        _t = time.perf_counter()
+        counts_cpu = counts.tolist()  # single CPU sync for all partners
+        # Precompute per-partner nonzero indices so recv_ffn_output can
+        # skip nonzero() at recv time (which would otherwise force a
+        # second, much more expensive sync behind pending NCCL+compute).
+        per_partner_indices: list[torch.Tensor] = []
+        for j in range(n_partners):
+            idx_j = all_masks[j].nonzero(as_tuple=True)[0]  # [count_j]
+            per_partner_indices.append(idx_j)
+        _timing.add("send_attn.moe.slice_subset", time.perf_counter() - _t)
+
+        # ---- Stage 3: per-partner NCCL sends using known counts. ----
+        masks_for_recv: list[torch.Tensor] = []
+        for j in range(n_partners):
+            count_j = counts_cpu[j]
+            idx_j = per_partner_indices[j]
+            masks_for_recv.append(idx_j)  # store indices, not the bool mask
 
             group = self.a2e_groups[j]
             comm_id = self.a2e_comm_ids[j]
             dst = self._partner_rank_in_pair(group.rank_in_group)
 
+            _t = time.perf_counter()
             count_hdr = torch.tensor(
                 [count_j, topk_k],
                 dtype=torch.int64,
@@ -584,8 +661,17 @@ class P2PAFDConnector(AFDConnectorBase):
                 count_hdr, dst, comm_id,
                 nvtx_label=f"attn->ffn[count_hdr,j={j}]",
             )
+            _timing.add("send_attn.moe.count_hdr_send", time.perf_counter() - _t)
 
             if count_j > 0:
+                _t = time.perf_counter()
+                # Use index_select with the precomputed indices. This gives
+                # known-shape outputs (no hidden sync). index_select is
+                # queued on the stream and runs in parallel with the NCCL
+                # sends issued right after.
+                hs_j = hidden_states.index_select(0, idx_j)
+                topk_ids_j = topk_ids.index_select(0, idx_j)
+                topk_weights_j = topk_weights.index_select(0, idx_j)
                 self._nccl_send(
                     hs_j, dst, comm_id,
                     nvtx_label=f"attn->ffn[hs,j={j}]",
@@ -598,8 +684,11 @@ class P2PAFDConnector(AFDConnectorBase):
                     topk_weights_j, dst, comm_id,
                     nvtx_label=f"attn->ffn[topk_weights,j={j}]",
                 )
+                _timing.add("send_attn.moe.tensor_sends", time.perf_counter() - _t)
 
-        self._pending_masks = masks
+        self._pending_masks = masks_for_recv  # now: list of index tensors
+        self._pending_counts = counts_cpu  # stash counts to avoid re-sync
+        _timing.add("send_attn.moe_total", time.perf_counter() - _t_send_total)
 
     def recv_ffn_output(
         self,
@@ -632,6 +721,8 @@ class P2PAFDConnector(AFDConnectorBase):
             dtype = self._pending_dtype
             device = self._pending_device
 
+        _t_recv_total = time.perf_counter()
+
         if self._pending_masks is None:
             # Dense: recv from each partner, keep the first result.
             final: torch.Tensor | None = None
@@ -649,19 +740,28 @@ class P2PAFDConnector(AFDConnectorBase):
             if final is None:
                 final = torch.zeros(shape, dtype=dtype, device=device)
             self._clear_attn_pending()
+            _timing.add("recv_ffn.dense_total", time.perf_counter() - _t_recv_total)
             return final
 
         # MoE: recv partials and scatter-add.
+        # Counts and per-partner index tensors were stashed by
+        # send_attn_output, so we do not need to call .sum().item() or
+        # .nonzero() here (which would force a sync behind the NCCL
+        # recvs and compute on the stream).
         hidden_size = shape[-1]
+        _t = time.perf_counter()
         final_hidden = torch.zeros(shape, dtype=dtype, device=device)
+        _timing.add("recv_ffn.moe.alloc_final", time.perf_counter() - _t)
+        assert self._pending_counts is not None
         for j in range(n_partners):
-            mask_j = self._pending_masks[j]
-            count_j = int(mask_j.sum().item())
+            indices_j = self._pending_masks[j]  # GPU index tensor [count_j]
+            count_j = self._pending_counts[j]  # Python int (from send sync)
             if count_j == 0:
                 continue
             group = self.e2a_groups[j]
             comm_id = self.e2a_comm_ids[j]
             src = self._partner_rank_in_pair(group.rank_in_group)
+            _t = time.perf_counter()
             partial = torch.empty(
                 (count_j, hidden_size), dtype=dtype, device=device,
             )
@@ -669,8 +769,10 @@ class P2PAFDConnector(AFDConnectorBase):
                 partial, src, comm_id,
                 nvtx_label=f"attn<-ffn[partial,j={j}]",
             )
-            indices = mask_j.nonzero(as_tuple=True)[0]
-            final_hidden.index_add_(0, indices, partial.to(final_hidden.dtype))
+            _timing.add("recv_ffn.moe.recv_partial", time.perf_counter() - _t)
+            _t = time.perf_counter()
+            final_hidden.index_add_(0, indices_j, partial.to(final_hidden.dtype))
+            _timing.add("recv_ffn.moe.scatter_add", time.perf_counter() - _t)
 
         if self._pending_shared_output is not None:
             final_hidden = final_hidden + self._pending_shared_output.to(
@@ -678,10 +780,18 @@ class P2PAFDConnector(AFDConnectorBase):
             )
 
         self._clear_attn_pending()
+        _timing.add("recv_ffn.moe_total", time.perf_counter() - _t_recv_total)
+        # One forward pass on ATTN is made of many send_attn/recv_ffn
+        # layer calls. Use the final recv (from forward_with_afd after the
+        # layer loop) as the "end of forward pass" marker. The layer-0
+        # case skips this since there's an extra recv before/after, but
+        # the totals are still useful.
+        _timing.mark_forward_pass_end(role=self.role, world_rank=self.world_rank)
         return final_hidden
 
     def _clear_attn_pending(self) -> None:
         self._pending_masks = None
+        self._pending_counts = None
         self._pending_shared_output = None
         self._pending_shape = None
         self._pending_dtype = None
@@ -704,32 +814,51 @@ class P2PAFDConnector(AFDConnectorBase):
           - ``topk_ids``, ``topk_weights``: concatenated across sources when
             this is a MoE layer; ``None`` for dense layers.
         """
+        _t_recv_total = time.perf_counter()
         n_partners = len(self.a2e_groups)
         hidden_size = self.config.model_config.hf_config.hidden_size
         device = torch.device(f"cuda:{self.local_rank}")
         dtype = self.config.model_config.dtype
 
-        source_counts: list[int] = []
-        hs_parts: list[torch.Tensor] = []
-        topk_ids_parts: list[torch.Tensor] = []
-        topk_weights_parts: list[torch.Tensor] = []
-        any_topk = False
-
+        # ---- Stage 1: post all count_hdr recvs first (all async), then
+        # sync ONCE to read every partner's count. This avoids N separate
+        # .cpu() calls, each of which would drain the whole CUDA stream
+        # backlog. ----
+        _t = time.perf_counter()
+        count_hdrs: list[torch.Tensor] = []
         for i in range(n_partners):
             group = self.a2e_groups[i]
             comm_id = self.a2e_comm_ids[i]
             src = self._partner_rank_in_pair(group.rank_in_group)
-
             count_hdr = torch.empty((2,), dtype=torch.int64, device=device)
             self._nccl_recv_into(
                 count_hdr, src, comm_id,
                 nvtx_label=f"ffn<-attn[count_hdr,i={i}]",
             )
-            count_i, topk_k_i = count_hdr.cpu().tolist()
-            source_counts.append(count_i)
+            count_hdrs.append(count_hdr)
+        # Stack into one [n_partners, 2] tensor and do a single CPU sync.
+        stacked = torch.stack(count_hdrs, dim=0)
+        stacked_cpu = stacked.cpu().tolist()
+        source_counts: list[int] = [row[0] for row in stacked_cpu]
+        topk_k_per_partner: list[int] = [row[1] for row in stacked_cpu]
+        any_topk = any(k > 0 for k in topk_k_per_partner)
+        _timing.add("recv_attn.count_hdr_sync", time.perf_counter() - _t)
 
+        # ---- Stage 2: now that counts are known, post all tensor recvs. ----
+        hs_parts: list[torch.Tensor] = []
+        topk_ids_parts: list[torch.Tensor] = []
+        topk_weights_parts: list[torch.Tensor] = []
+
+        _t = time.perf_counter()
+        for i in range(n_partners):
+            count_i = source_counts[i]
+            topk_k_i = topk_k_per_partner[i]
             if count_i == 0:
                 continue
+
+            group = self.a2e_groups[i]
+            comm_id = self.a2e_comm_ids[i]
+            src = self._partner_rank_in_pair(group.rank_in_group)
 
             hs_buf = torch.empty(
                 (count_i, hidden_size), dtype=dtype, device=device,
@@ -741,7 +870,6 @@ class P2PAFDConnector(AFDConnectorBase):
             hs_parts.append(hs_buf)
 
             if topk_k_i > 0:
-                any_topk = True
                 topk_ids_buf = torch.empty(
                     (count_i, topk_k_i), dtype=torch.int32, device=device,
                 )
@@ -758,9 +886,11 @@ class P2PAFDConnector(AFDConnectorBase):
                 )
                 topk_ids_parts.append(topk_ids_buf)
                 topk_weights_parts.append(topk_weights_buf)
+        _timing.add("recv_attn.tensor_recvs", time.perf_counter() - _t)
 
         self._pending_source_counts = source_counts
 
+        _t = time.perf_counter()
         total_tokens = sum(source_counts)
         if total_tokens == 0:
             hs = torch.empty((0, hidden_size), dtype=dtype, device=device)
@@ -768,6 +898,7 @@ class P2PAFDConnector(AFDConnectorBase):
             hs = hs_parts[0]
         else:
             hs = torch.cat(hs_parts, dim=0)
+        _timing.add("recv_attn.cat", time.perf_counter() - _t)
 
         if any_topk:
             topk_ids = (
@@ -793,6 +924,7 @@ class P2PAFDConnector(AFDConnectorBase):
             topk_ids=topk_ids,
             topk_weights=topk_weights,
         )
+        _timing.add("recv_attn.total", time.perf_counter() - _t_recv_total)
         return hs, meta
 
     def send_ffn_output(
@@ -806,6 +938,7 @@ class P2PAFDConnector(AFDConnectorBase):
         ``recv_attn_output``. The order matches the ATTN partner order
         (i = 0, 1, ..., attn_size-1).
         """
+        _t_send_total = time.perf_counter()
         assert self._pending_source_counts is not None
         source_counts = self._pending_source_counts
         n_partners = len(self.e2a_groups)
@@ -830,3 +963,8 @@ class P2PAFDConnector(AFDConnectorBase):
             )
 
         self._pending_source_counts = None
+        _timing.add("send_ffn.total", time.perf_counter() - _t_send_total)
+        # FFN forward pass end marker: send_ffn_output is called once per
+        # layer, and the final layer's send is followed by the FFN worker
+        # loop's cuda.synchronize(). Treat this as "one unit of work".
+        _timing.mark_forward_pass_end(role=self.role, world_rank=self.world_rank)
