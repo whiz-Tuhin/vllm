@@ -225,6 +225,60 @@ class DeepseekV2MLP(nn.Module):
         return x
 
 
+class DeepseekV2MoEAttentionStub(nn.Module):
+    """ATTN-side stub that holds the MoE gate and shared experts.
+
+    Used for the AFD pre-routing design where ATTN runs the router and
+    shared-expert compute locally before sending tokens to FFN workers.
+
+    This module only contains:
+      - `gate`: the MoE router (ReplicatedLinear), produces router_logits
+      - `shared_experts`: DeepseekV2MLP that runs on all tokens (optional)
+      - `e_score_correction_bias`: optional bias for noaux_tc topk method
+
+    The routed experts live on the FFN side (as a `DeepseekV2MoE`).
+    Weight names match the original `DeepseekV2MoE.mlp.*` layout so
+    checkpoint loading works unchanged.
+    """
+
+    def __init__(
+        self,
+        config: DeepseekV2Config | DeepseekV3Config,
+        quant_config: QuantizationConfig | None = None,
+        prefix: str = "",
+    ):
+        super().__init__()
+        self.routed_scaling_factor = getattr(config, "routed_scaling_factor", 1.0)
+        self.n_routed_experts: int = config.n_routed_experts
+
+        self.gate = ReplicatedLinear(
+            config.hidden_size,
+            config.n_routed_experts,
+            bias=False,
+            quant_config=None,
+            prefix=f"{prefix}.gate",
+        )
+        if getattr(config, "topk_method", None) == "noaux_tc":
+            self.gate.e_score_correction_bias = nn.Parameter(
+                torch.empty(config.n_routed_experts, dtype=torch.float32)
+            )
+        else:
+            self.gate.e_score_correction_bias = None
+
+        if config.n_shared_experts is None:
+            self.shared_experts = None
+        else:
+            intermediate_size = config.moe_intermediate_size * config.n_shared_experts
+            self.shared_experts = DeepseekV2MLP(
+                hidden_size=config.hidden_size,
+                intermediate_size=intermediate_size,
+                hidden_act=config.hidden_act,
+                quant_config=quant_config,
+                reduce_results=False,
+                prefix=f"{prefix}.shared_experts",
+            )
+
+
 class DeepseekV2MoE(nn.Module):
     def __init__(
         self,
@@ -964,12 +1018,14 @@ class DeepseekV2DecoderLayer(nn.Module):
                 topk_indices_buffer=topk_indices_buffer,
             )
 
+        is_moe_layer = (
+            config.n_routed_experts is not None
+            and layer_idx >= config.first_k_dense_replace
+            and layer_idx % moe_layer_freq == 0
+        )
+
         if self.afd_role is None or self.afd_role == "ffn":
-            if (
-                config.n_routed_experts is not None
-                and layer_idx >= config.first_k_dense_replace
-                and layer_idx % moe_layer_freq == 0
-            ):
+            if is_moe_layer:
                 self.mlp = DeepseekV2MoE(
                     config=config,
                     parallel_config=parallel_config,
@@ -984,6 +1040,17 @@ class DeepseekV2DecoderLayer(nn.Module):
                     quant_config=quant_config,
                     prefix=f"{prefix}.mlp",
                 )
+        elif self.afd_role == "attention" and is_moe_layer:
+            # AFD pre-routing: ATTN side holds the MoE gate and shared
+            # experts so it can run the router locally and compute the
+            # shared-expert output before sending tokens to FFN workers.
+            # Phase 1: weights are loaded here but not yet used in the
+            # forward path — that wires up in later phases.
+            self.mlp = DeepseekV2MoEAttentionStub(
+                config=config,
+                quant_config=quant_config,
+                prefix=f"{prefix}.mlp",
+            )
 
         self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = RMSNorm(
@@ -1530,7 +1597,16 @@ class DeepseekV2ForCausalLM(
                 continue
 
             if self.afd_role == "attention" and self.is_moe_weight(name):
-                continue
+                # AFD pre-routing: ATTN side holds the MoE gate and the
+                # shared experts (DeepseekV2MoEAttentionStub). Let those
+                # weights through; skip everything else (routed experts).
+                is_router_gate = (
+                    ".gate.weight" in name
+                    or ".gate.e_score_correction_bias" in name
+                )
+                is_shared_expert = "shared_experts" in name
+                if not (is_router_gate or is_shared_expert):
+                    continue
 
             spec_layer = get_spec_layer_idx_from_weight_name(self.config, name)
             if spec_layer is not None:
