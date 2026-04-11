@@ -739,9 +739,7 @@ class Worker(WorkerBase):
             try:
                 while not self._ffn_shutdown_event.is_set():
                     # Execute FFN computation
-                    logger.info("jcz before recv_dp_metadata_list")
                     dp_metadata_list, is_attn_graph_capturing = self.model_runner.connector.recv_dp_metadata_list()
-                    logger.info(f"jcz after recv_dp_metadata_list dp_metadata_list:{dp_metadata_list}")
                     if is_attn_graph_capturing:
                         self.model_runner.capture_model(
                             dp_metadata_list=dp_metadata_list,

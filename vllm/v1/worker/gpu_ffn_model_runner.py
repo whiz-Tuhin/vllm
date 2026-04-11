@@ -218,7 +218,6 @@ class GPUFFNModelRunner(LoRAModelRunnerMixin):
                         is_graph_capturing=is_graph_capturing,
                     )
             else:
-                logger.info(f"ffn_forward, dp_metadata_list is {dp_metadata_list}")
                 self._ffn_forward(
                     dp_metadata_list=dp_metadata_list,
                     is_graph_capturing=is_graph_capturing,

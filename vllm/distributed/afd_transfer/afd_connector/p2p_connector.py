@@ -459,18 +459,13 @@ class P2PAFDConnector(AFDConnectorBase):
         object_tensor = torch.frombuffer(bytearray(object_bytes), dtype=torch.uint8)
         size_tensor = torch.tensor([object_tensor.numel()], dtype=torch.long)
 
-        for j, gloo_pg in enumerate(self.a2e_gloo_pgs):
-            logger.info(
-                f"send_dp_metadata_list pair_index={j} "
-                f"is_graph_capturing={is_graph_capturing}"
-            )
+        for gloo_pg in self.a2e_gloo_pgs:
             gloo_pg.send([size_tensor], 0, 0).wait()
             gloo_pg.send([object_tensor], 0, 0).wait()
 
     def recv_dp_metadata_list(self):
         """FFN → recv from its ATTN DP0 pair (index 0 of a2e_gloo_pgs)."""
         gloo_pg = self.a2e_gloo_pgs[0]
-        logger.info("recv_dp_metadata_list waiting for metadata from ATTN")
 
         size_tensor = torch.empty(1, dtype=torch.long)
         gloo_pg.recv([size_tensor], 1, 0).wait()
@@ -478,7 +473,6 @@ class P2PAFDConnector(AFDConnectorBase):
         gloo_pg.recv([object_tensor], 1, 0).wait()
 
         data, is_graph_capturing = pickle.loads(object_tensor.numpy().tobytes())
-        logger.info(f"recv_dp_metadata_list is_graph_capturing={is_graph_capturing}")
         return data, is_graph_capturing
 
     def is_attn_top_min_size_rank(self, rank) -> bool:

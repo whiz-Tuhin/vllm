@@ -3637,17 +3637,13 @@ class GPUModelRunner(
                     )
                 dp_metadata_list[0] = dp_metadata
 
-            # to support inequal AF,[ffn_size,ffn_size + min_size) send
             if self.afd_config and self.afd_connector.is_attn_top_min_size_rank(self.afd_connector.world_rank):
-                logger.info(f'jcz self.afd_connector.world_rank in prepare input is {self.afd_connector.world_rank}')
-                logger.info(f'jcz self.afd_connector.world_rank in prepare input dp_metadata_list:{dp_metadata_list}')
                 self.afd_connector.send_dp_metadata_list(dp_metadata_list)
             elif self.afd_config and self.afd_connector.is_initialized():
-                # --- NEW CODE: Non-top-min-size ATTN ranks still need local metadata
-                # for recv_ffn_output to know tensor shapes. send_dp_metadata_list calls
-                # update_state_from_dp_metadata internally, but non-sending ranks skip it. ---
+                # Non-sending ATTN ranks still need local metadata so recv_ffn_output
+                # can size its output buffers; send_dp_metadata_list normally handles
+                # this internally.
                 self.afd_connector.update_state_from_dp_metadata(dp_metadata_list)
-            logger.info(f'jcz send dp_metadata_list in prepare input')
 
             model_output = self._model_forward(
                 input_ids=input_ids,
@@ -5008,14 +5004,10 @@ class GPUModelRunner(
                         )
                     dp_metadata_list[0] = dp_metadata
 
-                # to support inequal AF,[ffn_size,ffn_size + min_size) send
                 if self.afd_config and self.afd_connector.is_attn_top_min_size_rank(self.afd_connector.world_rank):
-                    logger.info(f'jcz self.afd_connector.world_rank in prepare input is {self.afd_connector.world_rank}')
-                    logger.info(f'jcz self.afd_connector.world_rank in prepare input dp_metadata_list:{dp_metadata_list}')
                     self.afd_connector.send_dp_metadata_list(dp_metadata_list, is_graph_capturing)
                 elif self.afd_config and self.afd_connector.is_initialized():
                     self.afd_connector.update_state_from_dp_metadata(dp_metadata_list, is_graph_capturing)
-                logger.info(f'jcz send dp_metadata_list in prepare input')
                 outputs = self.model(
                     input_ids=input_ids,
                     positions=positions,
