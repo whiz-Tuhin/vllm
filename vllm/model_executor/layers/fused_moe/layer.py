@@ -1992,31 +1992,51 @@ class FusedMoE(CustomOp):
         router ``select_experts``, EP dispatch, EP combine, and the shared
         experts — all of which are handled on the ATTN side or are not
         applicable in the pre-routed flow. Each FFN worker only processes
-        the subset of tokens it received; ``expert_map`` inside the quant
-        method's apply() ensures non-local expert assignments contribute
-        zero.
+        the subset of tokens it received; ``expert_map`` marks non-local
+        expert assignments so they contribute zero.
+
+        Critical: we must NOT go through ``quant_method.apply`` here. That
+        path dispatches into ``FusedMoEModularKernel.forward``, whose
+        ``_prepare`` / ``_finalize`` hooks run the EP dispatch/combine
+        collectives (NaiveEP all-gather + reduce-scatter). Pre-routing
+        already placed each token on the worker that owns its experts —
+        running the collectives again both duplicates work and adds
+        hundreds of ms/layer of stream stalls. Instead, we call the raw
+        ``fused_experts`` entry point directly, which only does the
+        per-expert Triton gemm kernels.
 
         Returns a [N_local_tokens, hidden_size] tensor of partial routed-
         expert contributions. The ATTN side combines partials across FFN
-        partners via scatter-add.
+        partners via element-wise sum.
         """
+        from vllm.model_executor.layers.fused_moe.fused_moe import fused_experts
+        from vllm.model_executor.layers.fused_moe.config import (
+            FUSED_MOE_UNQUANTIZED_CONFIG,
+        )
+
         assert self.quant_method is not None
         self.ensure_moe_quant_config_init()
 
         if hidden_states.shape[0] == 0:
-            # Empty shard — just return zeros of the expected shape.
             return torch.zeros_like(hidden_states)
 
-        result = self.quant_method.apply(
-            layer=self,
-            x=hidden_states,
+        quant_config = getattr(
+            self.quant_method, "moe_quant_config", None
+        ) or FUSED_MOE_UNQUANTIZED_CONFIG
+
+        return fused_experts(
+            hidden_states=hidden_states,
+            w1=self.w13_weight,
+            w2=self.w2_weight,
             topk_weights=topk_weights,
             topk_ids=topk_ids,
+            inplace=False,
+            activation=self.activation,
+            apply_router_weight_on_input=self.apply_router_weight_on_input,
+            global_num_experts=self.global_num_experts,
+            expert_map=self.expert_map,
+            quant_config=quant_config,
         )
-        # SharedFusedMoE may return (shared, routed). We want only routed.
-        if isinstance(result, tuple):
-            _, result = result
-        return result
 
     @classmethod
     def make_expert_params_mapping(

@@ -24,6 +24,7 @@
 # limitations under the License.
 """Inference-only DeepseekV2/DeepseekV3 model."""
 
+import time
 import typing
 from collections.abc import Callable, Iterable
 from itertools import islice
@@ -43,6 +44,7 @@ from vllm.distributed import (
     tensor_model_parallel_all_gather,
 )
 from vllm.distributed.afd_transfer.afd_connector.metadata import AFDConnectorMetadata
+from vllm.distributed.afd_transfer.afd_connector.p2p_connector import _timing as _afd_timing
 from vllm.forward_context import get_forward_context
 from vllm.logger import init_logger
 from vllm.model_executor.layers.activation import SiluAndMul
@@ -1288,15 +1290,18 @@ class DeepseekV2Model(nn.Module):
         llama_4_scaling: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         for layer_idx, layer in enumerate(islice(self.layers, self.start_layer, self.end_layer)):
+            _t_iter = time.perf_counter()
             afd_connector = afd_metadata.afd_connector
 
             if layer_idx > 0:
                 # Pass current hidden_states as ref_tensor to preserve dynamic shapes
                 hidden_states = afd_connector.recv_ffn_output(ref_tensor=hidden_states)
 
+            _t_layer = time.perf_counter()
             hidden_states, residual = layer(
                 positions, hidden_states, residual, llama_4_scaling
             )
+            _afd_timing.add("attn_layer.self_attn", time.perf_counter() - _t_layer)
 
             # For MoE layers the ATTN side runs the router and the shared
             # experts locally (see DeepseekV2MoEAttentionStub). send_attn_output
@@ -1307,9 +1312,11 @@ class DeepseekV2Model(nn.Module):
             topk_weights: torch.Tensor | None = None
             shared_output: torch.Tensor | None = None
             if isinstance(getattr(layer, "mlp", None), DeepseekV2MoEAttentionStub):
+                _t_route = time.perf_counter()
                 topk_ids, topk_weights, shared_output = (
                     layer.mlp.compute_route_and_shared(hidden_states)
                 )
+                _afd_timing.add("attn_layer.route_shared", time.perf_counter() - _t_route)
 
             metadata = AFDConnectorMetadata.create_attention_metadata(
                 layer_idx=layer.layer_idx,
@@ -1329,6 +1336,7 @@ class DeepseekV2Model(nn.Module):
             )
 
             hidden_states = apply_dbo_yield(hidden_states)
+            _afd_timing.add("attn_layer.iter_total", time.perf_counter() - _t_iter)
 
         hidden_states = afd_connector.recv_ffn_output(ref_tensor=hidden_states)
 

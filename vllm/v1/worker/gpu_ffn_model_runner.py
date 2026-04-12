@@ -12,6 +12,7 @@ from vllm.config import VllmConfig
 from vllm.config.compilation import CUDAGraphMode
 from vllm.distributed.afd_transfer.afd_connector.factory import AFDConnectorFactory
 from vllm.distributed.afd_transfer.afd_connector.metadata import AFDConnectorMetadata
+from vllm.distributed.afd_transfer.afd_connector.p2p_connector import _timing as _afd_timing
 from vllm.distributed.communication_op import tensor_model_parallel_all_gather
 from vllm.profiler.wrapper import TorchProfilerWrapper, CudaProfilerWrapper
 from vllm.distributed.parallel_state import (
@@ -179,11 +180,16 @@ class GPUFFNModelRunner(LoRAModelRunnerMixin):
                         with torch.profiler.record_function(
                             f"ffn_compute_layer_{layer_idx}_ubatch_{ubatch_idx}"
                         ):
+                            _t_compute = time.perf_counter()
                             rank_ffn_output = self._execute_eager_mode(
                                 hidden_states,
                                 layer_idx,
                                 topk_ids=topk_ids,
                                 topk_weights=topk_weights,
+                            )
+                            _afd_timing.add(
+                                "compute_ffn.total",
+                                time.perf_counter() - _t_compute,
                             )
 
                     with torch.profiler.record_function(
