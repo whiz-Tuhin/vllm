@@ -688,6 +688,18 @@ class Worker(WorkerBase):
         return self.model_runner.take_draft_token_ids()
 
     def profile(self, is_start: bool = True):
+        # FFN workers have their own profiler instance on the model runner
+        # (with the correct ``ffn-...`` worker_name in the trace handler).
+        # Route the start/stop there so the FFN-side traces actually flush
+        # to disk for multi-worker FFN configs (TP > 1).
+        if self.vllm_config.afd_config and self.vllm_config.afd_config.is_ffn_server:
+            if hasattr(self.model_runner, "start_profile") and is_start:
+                self.model_runner.start_profile()
+                return
+            if hasattr(self.model_runner, "stop_profile") and not is_start:
+                self.model_runner.stop_profile()
+                return
+
         if self.profiler is None:
             # raise RuntimeError(
             #     "Profiling is not enabled. Please set --profiler-config to enable "

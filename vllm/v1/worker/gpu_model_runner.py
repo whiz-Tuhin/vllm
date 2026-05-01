@@ -1501,7 +1501,6 @@ class GPUModelRunner(
         assert total_num_scheduled_tokens > 0
         num_reqs = self.input_batch.num_reqs
         assert num_reqs > 0
-        logger.info(f"nums_reqs: {num_reqs}")
         # OPTIMIZATION: Start copying the block table first.
         # This way, we can overlap the copy with the following CPU operations.
         self.input_batch.block_table.commit_block_table(num_reqs)
@@ -3606,10 +3605,10 @@ class GPUModelRunner(
             record_function_or_nullcontext("gpu_model_runner: forward"),
             self.maybe_get_kv_connector_output(scheduler_output) as kv_connector_output,
         ):
-            if input_ids is not None:
-                logger.info(f"input_ids: {input_ids.shape}")
-            if inputs_embeds is not None:
-                logger.info(f"inputs_embeds: {inputs_embeds.shape}")
+            # if input_ids is not None:
+            #     logger.info(f"input_ids: {input_ids.shape}")
+            # if inputs_embeds is not None:
+            #     logger.info(f"inputs_embeds: {inputs_embeds.shape}")
             
             # Build dp_metadata_list
             dp_metadata_list = {}

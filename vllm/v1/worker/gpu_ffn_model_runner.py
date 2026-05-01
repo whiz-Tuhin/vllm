@@ -58,6 +58,13 @@ class GPUFFNModelRunner(LoRAModelRunnerMixin):
         self._counter = 0
 
         # Torch/CUDA profiler. Enabled and configured through profiler_config.
+        # NOTE: gpu_worker.py has its own profiler instance. To avoid two
+        # competing torch.profiler.profile() objects in the same process
+        # (PyTorch only supports one active profile per process), we keep the
+        # FFN-side profiler here as the single source of truth and rely on
+        # the worker.profile() RPC to drive start/stop. The worker's own
+        # profiler is left unused for FFN workers — its profile() method is
+        # overridden via FFN-aware start_ffn_server_loop hooks.
         self.profiler: Any = None
         profiler_config = vllm_config.profiler_config
         if profiler_config.profiler == "torch":
@@ -72,6 +79,31 @@ class GPUFFNModelRunner(LoRAModelRunnerMixin):
             self.profiler = CudaProfilerWrapper(profiler_config)
         else:
             self.profiler = None
+
+    def start_profile(self) -> None:
+        """Start the FFN-side torch profiler.
+
+        Called by gpu_worker.profile(is_start=True) for FFN workers, so the
+        FFN-specific profiler (which has the correct trace handler with the
+        ``ffn-...`` worker name) is the one that actually captures events.
+        """
+        if self.profiler is None:
+            logger.info(
+                "FFN profiler not enabled, skipping. Use --profiler-config to enable."
+            )
+            return
+        self.profiler.start()
+
+    def stop_profile(self) -> None:
+        """Stop the FFN-side torch profiler and flush traces to disk.
+
+        Called from gpu_worker.profile(is_start=False) and from the FFN
+        server's shutdown path. Must be invoked before process exit, otherwise
+        torch.profiler holds events in memory and never writes them.
+        """
+        if self.profiler is None:
+            return
+        self.profiler.stop()
 
         # Initialize CUDA graph support
         self.use_cuda_graph = not self.model_config.enforce_eager

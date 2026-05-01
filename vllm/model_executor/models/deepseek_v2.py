@@ -1289,13 +1289,20 @@ class DeepseekV2Model(nn.Module):
         afd_metadata: AFDMetadata,
         llama_4_scaling: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        # Each ubatch under DBO calls forward_with_afd on its own thread with
+        # its own stage_idx. Stash it once so every recv_ffn_output / send_attn_output
+        # pair targets the right per-stage slot in the connector.
+        stage_idx = afd_metadata.afd_stage_idx if afd_metadata is not None else 0
+
         for layer_idx, layer in enumerate(islice(self.layers, self.start_layer, self.end_layer)):
             _t_iter = time.perf_counter()
             afd_connector = afd_metadata.afd_connector
 
             if layer_idx > 0:
                 # Pass current hidden_states as ref_tensor to preserve dynamic shapes
-                hidden_states = afd_connector.recv_ffn_output(ref_tensor=hidden_states)
+                hidden_states = afd_connector.recv_ffn_output(
+                    ref_tensor=hidden_states, stage_idx=stage_idx,
+                )
 
             _t_layer = time.perf_counter()
             hidden_states, residual = layer(
@@ -1338,7 +1345,9 @@ class DeepseekV2Model(nn.Module):
             hidden_states = apply_dbo_yield(hidden_states)
             _afd_timing.add("attn_layer.iter_total", time.perf_counter() - _t_iter)
 
-        hidden_states = afd_connector.recv_ffn_output(ref_tensor=hidden_states)
+        hidden_states = afd_connector.recv_ffn_output(
+            ref_tensor=hidden_states, stage_idx=stage_idx,
+        )
 
         return hidden_states, residual
 

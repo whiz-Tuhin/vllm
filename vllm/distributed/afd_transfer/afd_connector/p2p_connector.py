@@ -245,6 +245,20 @@ class P2PAFDConnector(AFDConnectorBase):
         self.config = config
         self._initialized: bool = False
 
+        # Option A (true pre-routing) toggle. When set via env var
+        # ``VLLM_AFD_USE_PREROUTING=1``, send_attn_output computes per-partner
+        # masks and ships only the subset of tokens each FFN worker needs to
+        # compute local experts for. Default off — keep Option B (broadcast).
+        # See afd-m2n-rewrite/optimisation/AFD-communication-structure.md §7.
+        self.use_prerouting: bool = (
+            os.environ.get("VLLM_AFD_USE_PREROUTING", "0") == "1"
+        )
+        if self.use_prerouting:
+            logger.info(
+                "[P2PAFDConnector] Pre-routing (Option A) ENABLED via "
+                "VLLM_AFD_USE_PREROUTING=1"
+            )
+
         # Infer hidden layer count (for DeepSeek V2 and models that hide the
         # text config behind ``text_config``).
         hf_config = self.config.model_config.hf_config
@@ -281,16 +295,22 @@ class P2PAFDConnector(AFDConnectorBase):
         # the Python-int counts read via a single .cpu() sync at send
         # time, letting recv_ffn_output skip any further data-dependent
         # operations that would force syncs behind pending NCCL/compute.
-        self._pending_masks: list[torch.Tensor] | None = None
-        self._pending_counts: list[int] | None = None
-        self._pending_shared_output: torch.Tensor | None = None
-        self._pending_shape: tuple[int, ...] | None = None
-        self._pending_dtype: torch.dtype | None = None
-        self._pending_device: torch.device | None = None
+        #
+        # Each field is keyed by ``stage_idx`` (afd_metadata.afd_stage_idx)
+        # so DBO's two concurrent ubatch threads don't clobber each other's
+        # state. For non-DBO single-stage forward passes, only stage 0 is
+        # ever populated; the dict overhead is negligible.
+        self._pending_masks: dict[int, list[torch.Tensor]] = {}
+        self._pending_counts: dict[int, list[int]] = {}
+        self._pending_shared_output: dict[int, torch.Tensor | None] = {}
+        self._pending_shape: dict[int, tuple[int, ...]] = {}
+        self._pending_dtype: dict[int, torch.dtype] = {}
+        self._pending_device: dict[int, torch.device] = {}
 
         # FFN-side recv→send lifecycle state. Populated in recv_attn_output;
-        # consumed and cleared in send_ffn_output.
-        self._pending_source_counts: list[int] | None = None
+        # consumed and cleared in send_ffn_output. Keyed by ``stage_idx``
+        # for DBO safety (same rationale as the ATTN-side fields above).
+        self._pending_source_counts: dict[int, list[int]] = {}
 
         # Tensor metadata cache (from dp_metadata). Used for stage-wise lookups.
         self._tensor_metadata_list: dict[int, TensorMetadata] = {}
@@ -455,14 +475,24 @@ class P2PAFDConnector(AFDConnectorBase):
         nvtx_label: str = "",
     ) -> None:
         assert not tensor.is_cpu, "tensor must be on GPU"
+        nbytes = tensor.numel() * tensor.element_size()
         nvtx_msg = (
             f"afd_p2p_send|{nvtx_label}|shape={list(tensor.shape)}"
-            f"|dtype={tensor.dtype}|dst={dst}"
-            f"|bytes={tensor.numel() * tensor.element_size()}"
+            f"|dtype={tensor.dtype}|dst={dst}|bytes={nbytes}"
         )
         with torch.profiler.record_function("afd_p2p_send", args=nvtx_msg), \
              torch.cuda.nvtx.range(nvtx_msg):
             torch.ops.vllm.afd_p2p_send(tensor, dst, comm_id)
+        # Bandwidth instrumentation: total bytes shipped from this rank,
+        # accumulated under AFD_TIMING for Exp 1 (Option A vs B comparison).
+        # Adding 0.0 dt — we only care about the call count and bytes here.
+        if _timing.enabled:
+            _timing.totals["send_attn.bytes_total"] = (
+                _timing.totals.get("send_attn.bytes_total", 0.0) + nbytes
+            )
+            _timing.calls["send_attn.bytes_total"] = (
+                _timing.calls.get("send_attn.bytes_total", 0) + 1
+            )
 
     def _nccl_recv_into(
         self,
@@ -472,14 +502,21 @@ class P2PAFDConnector(AFDConnectorBase):
         nvtx_label: str = "",
     ) -> None:
         assert not tensor.is_cpu, "tensor must be on GPU"
+        nbytes = tensor.numel() * tensor.element_size()
         nvtx_msg = (
             f"afd_p2p_recv|{nvtx_label}|shape={list(tensor.shape)}"
-            f"|dtype={tensor.dtype}|src={src}"
-            f"|bytes={tensor.numel() * tensor.element_size()}"
+            f"|dtype={tensor.dtype}|src={src}|bytes={nbytes}"
         )
         with torch.profiler.record_function("afd_p2p_recv", args=nvtx_msg), \
              torch.cuda.nvtx.range(nvtx_msg):
             torch.ops.vllm.afd_p2p_recv(tensor, src, comm_id)
+        if _timing.enabled:
+            _timing.totals["recv.bytes_total"] = (
+                _timing.totals.get("recv.bytes_total", 0.0) + nbytes
+            )
+            _timing.calls["recv.bytes_total"] = (
+                _timing.calls.get("recv.bytes_total", 0) + 1
+            )
 
     # ------------------------------------------------------------------
     # dp_metadata (control plane, one-shot per forward pass)
@@ -560,55 +597,72 @@ class P2PAFDConnector(AFDConnectorBase):
         Arguments:
           hidden_states: [N, H] post-attention tensor.
           metadata:      AFDConnectorMetadata carrying per-layer info (layer
-                         index, stage, etc.). Sent implicitly by position.
+                         index, stage, etc.). The ``stage_idx`` field is used
+                         to key per-ubatch state for DBO safety.
           topk_ids:      [N, K] int32 (global expert indices) for MoE layers.
           topk_weights:  [N, K] float32 (routing weights) for MoE layers.
           shared_output: [N, H] shared-expert output computed on the ATTN
                          side; added after the partials are combined.
 
-        Protocol per FFN partner j:
-          1. Send count header ``[count_j, topk_k]`` (int64 tensor, shape 2)
-             — the FFN side peeks at this to know what follows.
-          2. If ``count_j > 0``: send ``hs_j [count_j, H]``.
-          3. If ``count_j > 0`` and ``topk_k > 0``: send topk_ids_j and
-             topk_weights_j for the masked subset.
-
-        For dense layers (topk_ids=None), the full hidden_states is
-        broadcast to all FFN partners and the count header uses topk_k=0.
-
-        Masks + shared_output are stashed for the matching ``recv_ffn_output``.
+        Per-call state (masks, shape, shared_output, etc.) is keyed by
+        ``metadata.stage_idx`` so two ubatch threads under DBO each have
+        their own slot and don't clobber one another.
         """
         n_partners = len(self.a2e_groups)
         assert n_partners > 0, "No FFN partners configured"
 
-        # Stash the shape so recv_ffn_output can allocate the output buffer.
-        self._pending_shape = tuple(hidden_states.shape)
-        self._pending_dtype = hidden_states.dtype
-        self._pending_device = hidden_states.device
-        self._pending_shared_output = shared_output
+        stage_idx = getattr(metadata, "stage_idx", 0) or 0
 
-        _t_send_total = time.perf_counter()
-
-        # Option B — fixed-size protocol: we always broadcast the full
-        # ``hidden_states`` tensor to every FFN partner. For MoE layers
-        # we additionally broadcast ``topk_ids`` and ``topk_weights``
-        # so the FFN side can run the pre-computed routing without
-        # re-running the gate. There is no masking, no count header,
-        # no CPU sync on the hot path — all shapes are known statically
-        # from the dp_metadata that was broadcast once per forward pass.
-        #
-        # Bandwidth-wise this is equivalent to the old EP all-gather +
-        # reduce-scatter pattern. The win is structural: (1) no
-        # collective coordination between FFN workers, so the M×N
-        # topology works for asymmetric configs; (2) zero per-layer
-        # CPU/GPU syncs, so NCCL ops can pipeline without draining
-        # stalls; (3) correct for EP=2 where the bandwidth savings
-        # of "real" pre-routing were negligible anyway (98% of tokens
-        # need both workers with top-k=6).
-        self._pending_masks = None  # signals recv_ffn_output to use the
-                                    # element-wise sum combine path.
+        # Stash the shape (per stage) so recv_ffn_output can allocate the
+        # output buffer for this ubatch's combine.
+        self._pending_shape[stage_idx] = tuple(hidden_states.shape)
+        self._pending_dtype[stage_idx] = hidden_states.dtype
+        self._pending_device[stage_idx] = hidden_states.device
+        self._pending_shared_output[stage_idx] = shared_output
 
         is_moe = topk_ids is not None
+        # Option A (true pre-routing) only applies to MoE layers with multiple
+        # FFN partners. Dense layer 0 still uses Option B (broadcast) because
+        # there are no routed experts — every FFN partner needs the full
+        # input. With a single FFN partner (xA1F), every token's experts are
+        # on that one partner, so Option A's mask is always all-True and
+        # degrades to Option B with extra count-header overhead.
+        use_a = (
+            self.use_prerouting
+            and is_moe
+            and self.experts_per_ffn_worker > 0
+            and n_partners > 1
+        )
+
+        if use_a:
+            self._send_attn_output_option_a(
+                hidden_states, topk_ids, topk_weights, stage_idx, n_partners,
+            )
+        else:
+            self._send_attn_output_option_b(
+                hidden_states, topk_ids, topk_weights, stage_idx, n_partners, is_moe,
+            )
+
+    def _send_attn_output_option_b(
+        self,
+        hidden_states: torch.Tensor,
+        topk_ids: torch.Tensor | None,
+        topk_weights: torch.Tensor | None,
+        stage_idx: int,
+        n_partners: int,
+        is_moe: bool,
+    ) -> None:
+        """Broadcast full ``hidden_states`` (and optionally topk) to each FFN
+        partner. No masking, no per-layer CPU/GPU sync. ~20-43% bandwidth
+        overhead vs Option A at EP≥4 but zero stream stalls.
+        """
+        _t_send_total = time.perf_counter()
+
+        # Empty masks list for this stage signals recv_ffn_output to use the
+        # element-wise sum combine path (since every partner returned a
+        # full-shape partial via expert_map filtering).
+        self._pending_masks[stage_idx] = []
+
         for j in range(n_partners):
             group = self.a2e_groups[j]
             comm_id = self.a2e_comm_ids[j]
@@ -617,43 +671,146 @@ class P2PAFDConnector(AFDConnectorBase):
             _t = time.perf_counter()
             self._nccl_send(
                 hidden_states, dst, comm_id,
-                nvtx_label=f"attn->ffn[hs,j={j}]",
+                nvtx_label=f"attn->ffn[hs,j={j},s={stage_idx}]",
             )
             if is_moe:
                 assert topk_weights is not None
                 self._nccl_send(
                     topk_ids, dst, comm_id,
-                    nvtx_label=f"attn->ffn[topk_ids,j={j}]",
+                    nvtx_label=f"attn->ffn[topk_ids,j={j},s={stage_idx}]",
                 )
                 self._nccl_send(
                     topk_weights, dst, comm_id,
-                    nvtx_label=f"attn->ffn[topk_weights,j={j}]",
+                    nvtx_label=f"attn->ffn[topk_weights,j={j},s={stage_idx}]",
                 )
             _timing.add("send_attn.tensor_sends", time.perf_counter() - _t)
 
         label = "send_attn.moe_total" if is_moe else "send_attn.dense_total"
         _timing.add(label, time.perf_counter() - _t_send_total)
 
+    def _send_attn_output_option_a(
+        self,
+        hidden_states: torch.Tensor,
+        topk_ids: torch.Tensor,
+        topk_weights: torch.Tensor,
+        stage_idx: int,
+        n_partners: int,
+    ) -> None:
+        """Send only the subset of tokens each FFN partner actually needs.
+
+        For each FFN partner j (which owns experts ``[j*E_per_ffn,
+        (j+1)*E_per_ffn)``), build a boolean mask over the [N] tokens that
+        have at least one top-k expert in that range, then send only the
+        masked subset. Combined on the recv side via ``index_add_``.
+
+        Sync handling: counts go through a single ``.cpu()`` per layer (one
+        4-byte int per partner). The PyTorch caching allocator and stream
+        ordering ensure the count tensor is on the same stream as the
+        upstream gate kernel, so this sync drains only the routing compute,
+        not the entire NCCL queue from prior layers (the cause of the
+        phase3c regression).
+
+        Each partner gets a 4-tensor send: count_hdr (1 int64), hs_subset,
+        topk_ids_subset, topk_weights_subset. The first send carries the
+        count so the FFN side knows the recv buffer size.
+        """
+        _t_send_total = time.perf_counter()
+
+        # Compute per-partner masks on GPU. No sync.
+        # mask_j: [N] bool — True if any of the token's K top-k experts is
+        # in [j*E_per_ffn, (j+1)*E_per_ffn).
+        masks: list[torch.Tensor] = []
+        for j in range(n_partners):
+            expert_lo = j * self.experts_per_ffn_worker
+            expert_hi = expert_lo + self.experts_per_ffn_worker
+            in_range = (topk_ids >= expert_lo) & (topk_ids < expert_hi)
+            mask_j = in_range.any(dim=1)  # [N]
+            masks.append(mask_j)
+
+        # Single CPU sync for all per-partner counts. Stack into one int64
+        # tensor, transfer asynchronously, then synchronize the current stream
+        # so the host has the counts before we issue per-partner sends.
+        counts_gpu = torch.stack([m.sum() for m in masks])  # [n_partners] int64
+        counts_cpu = counts_gpu.to('cpu', non_blocking=True)
+        torch.cuda.current_stream().synchronize()
+        counts: list[int] = counts_cpu.tolist()
+
+        # Stash masks for the recv-side combine. Move to CPU? No — we'll need
+        # ``mask_j.nonzero()`` indices on GPU to do the index_add_, so keep
+        # masks on GPU. Stash references; they're cleared by _clear_attn_pending.
+        self._pending_masks[stage_idx] = masks
+        self._pending_counts[stage_idx] = counts
+
+        for j in range(n_partners):
+            count_j = counts[j]
+            group = self.a2e_groups[j]
+            comm_id = self.a2e_comm_ids[j]
+            dst = self._partner_rank_in_pair(group.rank_in_group)
+
+            # Always send the count header (a 1-element int64 tensor) so the
+            # FFN side knows the size of the variable-length payload that
+            # follows. Sending even when count_j == 0 keeps both sides in
+            # lock-step on the comm stream.
+            count_hdr = counts_gpu[j:j + 1]  # [1] int64
+
+            _t = time.perf_counter()
+            self._nccl_send(
+                count_hdr, dst, comm_id,
+                nvtx_label=f"attn->ffn[count,j={j},s={stage_idx}]",
+            )
+            if count_j > 0:
+                # index_select with mask.nonzero() — the indices live on GPU,
+                # the gather goes onto the current stream, and the result is a
+                # newly allocated [count_j, ...] tensor. The .nonzero() call
+                # has data-dependent output shape, but we already paid the
+                # sync above, so this is just a fast GPU op.
+                idx_j = masks[j].nonzero(as_tuple=True)[0]  # [count_j]
+                hs_subset = hidden_states.index_select(0, idx_j)
+                ids_subset = topk_ids.index_select(0, idx_j)
+                w_subset = topk_weights.index_select(0, idx_j)
+
+                self._nccl_send(
+                    hs_subset, dst, comm_id,
+                    nvtx_label=f"attn->ffn[hs_subset,j={j},s={stage_idx}]",
+                )
+                self._nccl_send(
+                    ids_subset, dst, comm_id,
+                    nvtx_label=f"attn->ffn[ids_subset,j={j},s={stage_idx}]",
+                )
+                self._nccl_send(
+                    w_subset, dst, comm_id,
+                    nvtx_label=f"attn->ffn[w_subset,j={j},s={stage_idx}]",
+                )
+            _timing.add("send_attn.tensor_sends", time.perf_counter() - _t)
+
+        _timing.add("send_attn.moe_total", time.perf_counter() - _t_send_total)
+
     def recv_ffn_output(
         self,
         ref_tensor: torch.Tensor | None = None,
+        stage_idx: int = 0,
     ) -> torch.Tensor:
         """Receive partial FFN outputs and combine into the final tensor.
 
         Two modes:
-          - MoE (masks stashed by send_attn_output): receive one partial per
-            FFN partner, ``index_add_`` into a zero-init'd output using the
-            stored mask, then add the pending shared-expert output.
-          - Dense (no masks): receive from each partner (all identical after
-            the FFN-side TP all-reduce) and return the first one.
+          - MoE (shared_output stashed by send_attn_output for this stage):
+            receive one partial per FFN partner and sum element-wise, then
+            add the pending shared-expert output. ``self._pending_masks[stage_idx]``
+            is currently always empty (Option B); it's the hook for Option A's
+            ``index_add_`` combine.
+          - Dense (no shared_output): receive from each partner (all identical
+            after the FFN-side TP all-reduce) and return the first one.
 
         The ``ref_tensor`` parameter is accepted for signature compatibility
         with the old connector; its only use is to inherit shape/dtype/device
         when pending metadata is somehow missing.
+
+        ``stage_idx`` selects the per-ubatch slot of pending state. Defaults to
+        0 for the non-DBO path.
         """
         n_partners = len(self.e2a_groups)
 
-        if self._pending_shape is None:
+        if stage_idx not in self._pending_shape:
             # Fallback: recv_ffn_output called without a matching send. Use
             # ref_tensor if available.
             assert ref_tensor is not None
@@ -661,24 +818,58 @@ class P2PAFDConnector(AFDConnectorBase):
             dtype = ref_tensor.dtype
             device = ref_tensor.device
         else:
-            shape = self._pending_shape
-            dtype = self._pending_dtype
-            device = self._pending_device
+            shape = self._pending_shape[stage_idx]
+            dtype = self._pending_dtype[stage_idx]
+            device = self._pending_device[stage_idx]
 
         _t_recv_total = time.perf_counter()
 
-        # All paths are now fixed-size: each FFN partner returns a tensor of
-        # the same shape as the ATTN hidden_states we sent. The combine rule
-        # differs:
+        # The combine rule differs:
         #   - Dense layer (no shared output, no expert routing): pick one
-        #     partner's result; they're identical after the FFN's internal
-        #     TP all-reduce.
-        #   - MoE layer: every partner returns a partial where only its
-        #     local experts contributed; sum across partners to get the
-        #     full expert weighted sum, then add the shared-expert output
-        #     computed locally.
-        is_dense = self._pending_shared_output is None
+        #     partner's full-size result; they're identical after the FFN's
+        #     internal TP all-reduce.
+        #   - MoE layer Option B (broadcast): every partner returns a
+        #     full-shape partial; sum element-wise, then add shared output.
+        #   - MoE layer Option A (pre-routing): each partner returns only the
+        #     subset of tokens it received (count_j ≤ N rows). We index_add_
+        #     each subset into a zero-init'd output using the stored masks.
+        shared_out = self._pending_shared_output.get(stage_idx, None)
+        is_dense = shared_out is None
+        masks = self._pending_masks.get(stage_idx, [])
+        counts = self._pending_counts.get(stage_idx, [])
+        # Option A is in effect when masks/counts were populated by the
+        # matching ``_send_attn_output_option_a``. Option B leaves these empty.
+        use_a_combine = bool(masks) and bool(counts)
 
+        if use_a_combine:
+            final_hidden = self._recv_ffn_output_option_a(
+                masks, counts, shape, dtype, device, stage_idx, n_partners,
+            )
+        else:
+            final_hidden = self._recv_ffn_output_option_b(
+                shape, dtype, device, stage_idx, n_partners, is_dense,
+            )
+
+        if shared_out is not None:
+            _t = time.perf_counter()
+            final_hidden = final_hidden + shared_out.to(final_hidden.dtype)
+            _timing.add("recv_ffn.add_shared", time.perf_counter() - _t)
+
+        self._clear_attn_pending(stage_idx)
+        _timing.add("recv_ffn.total", time.perf_counter() - _t_recv_total)
+        _timing.mark_forward_pass_end(role=self.role, world_rank=self.world_rank)
+        return final_hidden
+
+    def _recv_ffn_output_option_b(
+        self,
+        shape: tuple[int, ...],
+        dtype: torch.dtype,
+        device: torch.device,
+        stage_idx: int,
+        n_partners: int,
+        is_dense: bool,
+    ) -> torch.Tensor:
+        """Option B / dense combine: each partner returned a full [N, H] tensor."""
         final_hidden: torch.Tensor | None = None
         for j in range(n_partners):
             group = self.e2a_groups[j]
@@ -688,7 +879,7 @@ class P2PAFDConnector(AFDConnectorBase):
             _t = time.perf_counter()
             self._nccl_recv_into(
                 buf, src, comm_id,
-                nvtx_label=f"attn<-ffn[hs,j={j}]",
+                nvtx_label=f"attn<-ffn[hs,j={j},s={stage_idx}]",
             )
             _timing.add("recv_ffn.recv_partial", time.perf_counter() - _t)
 
@@ -707,26 +898,60 @@ class P2PAFDConnector(AFDConnectorBase):
 
         if final_hidden is None:
             final_hidden = torch.zeros(shape, dtype=dtype, device=device)
-
-        if self._pending_shared_output is not None:
-            _t = time.perf_counter()
-            final_hidden = final_hidden + self._pending_shared_output.to(
-                final_hidden.dtype
-            )
-            _timing.add("recv_ffn.add_shared", time.perf_counter() - _t)
-
-        self._clear_attn_pending()
-        _timing.add("recv_ffn.total", time.perf_counter() - _t_recv_total)
-        _timing.mark_forward_pass_end(role=self.role, world_rank=self.world_rank)
         return final_hidden
 
-    def _clear_attn_pending(self) -> None:
-        self._pending_masks = None
-        self._pending_counts = None
-        self._pending_shared_output = None
-        self._pending_shape = None
-        self._pending_dtype = None
-        self._pending_device = None
+    def _recv_ffn_output_option_a(
+        self,
+        masks: list[torch.Tensor],
+        counts: list[int],
+        shape: tuple[int, ...],
+        dtype: torch.dtype,
+        device: torch.device,
+        stage_idx: int,
+        n_partners: int,
+    ) -> torch.Tensor:
+        """Option A combine: each partner returns ``count_j`` rows; we
+        ``index_add_`` them into a zero-init'd [N, H] tensor using the
+        ``mask_j.nonzero()`` indices stored at send time.
+
+        Counts are already on the host (read once during send), so we know
+        each recv's size statically without another sync.
+        """
+        final_hidden = torch.zeros(shape, dtype=dtype, device=device)
+        hidden_size = shape[-1]
+        for j in range(n_partners):
+            count_j = counts[j]
+            group = self.e2a_groups[j]
+            comm_id = self.e2a_comm_ids[j]
+            src = self._partner_rank_in_pair(group.rank_in_group)
+            if count_j == 0:
+                # No tokens for this partner — nothing to recv (FFN side also
+                # skips the partial send when it received 0 tokens).
+                continue
+            buf = torch.empty((count_j, hidden_size), dtype=dtype, device=device)
+            _t = time.perf_counter()
+            self._nccl_recv_into(
+                buf, src, comm_id,
+                nvtx_label=f"attn<-ffn[partial_subset,j={j},s={stage_idx}]",
+            )
+            _timing.add("recv_ffn.recv_partial", time.perf_counter() - _t)
+
+            _t = time.perf_counter()
+            idx_j = masks[j].nonzero(as_tuple=True)[0]  # [count_j]
+            final_hidden.index_add_(0, idx_j, buf)
+            _timing.add("recv_ffn.combine_add", time.perf_counter() - _t)
+        return final_hidden
+
+    def _clear_attn_pending(self, stage_idx: int = 0) -> None:
+        # Pop per-stage slots so a stale value never leaks into the next
+        # forward pass. Use pop(..., None) to be tolerant of half-populated
+        # state (e.g., if recv_ffn_output is called without a matching send).
+        self._pending_masks.pop(stage_idx, None)
+        self._pending_counts.pop(stage_idx, None)
+        self._pending_shared_output.pop(stage_idx, None)
+        self._pending_shape.pop(stage_idx, None)
+        self._pending_dtype.pop(stage_idx, None)
+        self._pending_device.pop(stage_idx, None)
 
     # ------------------------------------------------------------------
     # FFN side (hot path)
@@ -781,46 +1006,95 @@ class P2PAFDConnector(AFDConnectorBase):
                 cfg = cfg.text_config
             topk_k = getattr(cfg, "num_experts_per_tok", 0)
 
+        # Option A applies on the FFN side only for MoE layers when there are
+        # multiple ATTN partners on the other side that might send variable
+        # counts. The send-side guard mirrors this (n_partners > 1 there).
+        # n_partners on the FFN side is the ATTN count (= attn_size).
+        use_a = (
+            self.use_prerouting
+            and is_moe
+            and self.experts_per_ffn_worker > 0
+            and self.ffn_size > 1
+        )
+
         hs_parts: list[torch.Tensor] = []
         topk_ids_parts: list[torch.Tensor] = []
         topk_weights_parts: list[torch.Tensor] = []
+        # Will be filled with the actual per-partner source count for
+        # ``send_ffn_output`` to slice the partial output by.
+        actual_counts: list[int] = []
 
         for i in range(n_partners):
-            count_i = per_partner_count[i]
             group = self.a2e_groups[i]
             comm_id = self.a2e_comm_ids[i]
             src = self._partner_rank_in_pair(group.rank_in_group)
 
-            hs_buf = torch.empty(
-                (count_i, hidden_size), dtype=dtype, device=device,
-            )
-            _t = time.perf_counter()
-            self._nccl_recv_into(
-                hs_buf, src, comm_id,
-                nvtx_label=f"ffn<-attn[hs,i={i}]",
-            )
-            hs_parts.append(hs_buf)
+            if use_a:
+                # Option A: read the count header first to size the recv buffers.
+                # The count is sent as a 1-element int64 GPU tensor by the
+                # matching ``_send_attn_output_option_a``.
+                count_hdr = torch.empty((1,), dtype=torch.int64, device=device)
+                _t = time.perf_counter()
+                self._nccl_recv_into(
+                    count_hdr, src, comm_id,
+                    nvtx_label=f"ffn<-attn[count,i={i},s={ubatch_idx}]",
+                )
+                # Single sync per partner — small (1 int64), drains only the
+                # count recv kernel. We need this on host to size the next recv.
+                count_i = int(count_hdr.item())
+                actual_counts.append(count_i)
+                _timing.add("recv_attn.count_hdr", time.perf_counter() - _t)
+            else:
+                # Option B: count is known statically from dp_metadata.
+                count_i = per_partner_count[i]
+                actual_counts.append(count_i)
 
-            if is_moe and topk_k > 0:
-                topk_ids_buf = torch.empty(
-                    (count_i, topk_k), dtype=torch.int32, device=device,
+            _t = time.perf_counter()
+            if count_i > 0:
+                hs_buf = torch.empty(
+                    (count_i, hidden_size), dtype=dtype, device=device,
                 )
                 self._nccl_recv_into(
-                    topk_ids_buf, src, comm_id,
-                    nvtx_label=f"ffn<-attn[topk_ids,i={i}]",
+                    hs_buf, src, comm_id,
+                    nvtx_label=f"ffn<-attn[hs,i={i},s={ubatch_idx}]",
                 )
-                topk_weights_buf = torch.empty(
-                    (count_i, topk_k), dtype=torch.float32, device=device,
+                hs_parts.append(hs_buf)
+
+                if is_moe and topk_k > 0:
+                    topk_ids_buf = torch.empty(
+                        (count_i, topk_k), dtype=torch.int32, device=device,
+                    )
+                    self._nccl_recv_into(
+                        topk_ids_buf, src, comm_id,
+                        nvtx_label=f"ffn<-attn[topk_ids,i={i},s={ubatch_idx}]",
+                    )
+                    topk_weights_buf = torch.empty(
+                        (count_i, topk_k), dtype=torch.float32, device=device,
+                    )
+                    self._nccl_recv_into(
+                        topk_weights_buf, src, comm_id,
+                        nvtx_label=f"ffn<-attn[topk_weights,i={i},s={ubatch_idx}]",
+                    )
+                    topk_ids_parts.append(topk_ids_buf)
+                    topk_weights_parts.append(topk_weights_buf)
+            else:
+                # count_i == 0 — placeholder zero-row tensor so torch.cat works
+                # uniformly downstream.
+                hs_parts.append(
+                    torch.empty((0, hidden_size), dtype=dtype, device=device)
                 )
-                self._nccl_recv_into(
-                    topk_weights_buf, src, comm_id,
-                    nvtx_label=f"ffn<-attn[topk_weights,i={i}]",
-                )
-                topk_ids_parts.append(topk_ids_buf)
-                topk_weights_parts.append(topk_weights_buf)
+                if is_moe and topk_k > 0:
+                    topk_ids_parts.append(
+                        torch.empty((0, topk_k), dtype=torch.int32, device=device)
+                    )
+                    topk_weights_parts.append(
+                        torch.empty((0, topk_k), dtype=torch.float32, device=device)
+                    )
             _timing.add("recv_attn.tensor_recvs", time.perf_counter() - _t)
 
-        self._pending_source_counts = per_partner_count
+        # Stash per-stage so DBO's two ubatch threads each get their own slot.
+        # send_ffn_output uses these to split the per-partner output slices.
+        self._pending_source_counts[ubatch_idx] = actual_counts
 
         _t = time.perf_counter()
         hs = hs_parts[0] if len(hs_parts) == 1 else torch.cat(hs_parts, dim=0)
@@ -857,13 +1131,17 @@ class P2PAFDConnector(AFDConnectorBase):
     ) -> None:
         """Split the FFN output by source partner and return each slice.
 
-        Relies on ``self._pending_source_counts`` set by the matching
+        Relies on ``self._pending_source_counts[stage_idx]`` set by the matching
         ``recv_attn_output``. The order matches the ATTN partner order
         (i = 0, 1, ..., attn_size-1).
         """
         _t_send_total = time.perf_counter()
-        assert self._pending_source_counts is not None
-        source_counts = self._pending_source_counts
+        stage_idx = getattr(metadata, "stage_idx", 0) or 0
+        assert stage_idx in self._pending_source_counts, (
+            f"send_ffn_output called for stage {stage_idx} without a matching "
+            f"recv_attn_output (pending stages: {list(self._pending_source_counts)})"
+        )
+        source_counts = self._pending_source_counts[stage_idx]
         n_partners = len(self.e2a_groups)
         assert len(source_counts) == n_partners, (
             f"source_counts length {len(source_counts)} != {n_partners} partners"
@@ -882,9 +1160,10 @@ class P2PAFDConnector(AFDConnectorBase):
             dst = self._partner_rank_in_pair(group.rank_in_group)
             self._nccl_send(
                 slice_i, dst, comm_id,
-                nvtx_label=f"ffn->attn[partial,i={i}]",
+                nvtx_label=f"ffn->attn[partial,i={i},s={stage_idx}]",
             )
 
-        self._pending_source_counts = None
+        # Clear this stage's slot — leave other stages' state alone.
+        del self._pending_source_counts[stage_idx]
         _timing.add("send_ffn.total", time.perf_counter() - _t_send_total)
         _timing.mark_forward_pass_end(role=self.role, world_rank=self.world_rank)

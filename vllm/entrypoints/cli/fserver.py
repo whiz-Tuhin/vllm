@@ -28,6 +28,19 @@ class FServerCommand(CLISubcommand):
         # Add model as positional argument (like vllm serve)
         parser.add_argument("model", type=str, help="Model name or path")
 
+        # Optional HTTP control port for on-demand profiler start/stop.
+        parser.add_argument(
+            "--ffn-control-port",
+            type=int,
+            default=None,
+            help=(
+                "Optional port for an HTTP control server that exposes "
+                "POST /start_profile, POST /stop_profile, and GET /health. "
+                "Useful for taking measurement-quality torch traces without "
+                "restarting the FFN server. Default: not started."
+            ),
+        )
+
         # Use AsyncEngineArgs to add all vLLM engine arguments
         parser = AsyncEngineArgs.add_cli_args(parser)
 
